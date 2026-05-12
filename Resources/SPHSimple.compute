@@ -1,0 +1,536 @@
+// Assets/Resources/SPHSimple.compute
+// Simple, robust GPU SPH (no prefix-scan sorting).
+// Grid is a fixed-capacity per-cell list built with atomics.
+// Designed to compile on DX11 (<=8 UAVs per kernel).
+
+#pragma target 5.0
+
+#pragma kernel ClearCellCounts
+#pragma kernel BuildCellLists
+#pragma kernel DensityPressure
+#pragma kernel Forces
+#pragma kernel Integrate
+#pragma kernel ApplyBlastImpulse
+#pragma kernel ClearVelAcc
+#pragma kernel FreezeBed
+#pragma kernel FreezeAll
+#pragma kernel WakeSphere
+#pragma kernel ClearSleep
+#pragma kernel UpdateSleepSurfaceOnly
+#pragma kernel ForceSleepBelowY
+
+// ---------------- RW buffers (UAV) ----------------
+RWStructuredBuffer<float3> _Pos;
+RWStructuredBuffer<float3> _Vel;
+RWStructuredBuffer<float3> _Acc;
+
+RWStructuredBuffer<float>  _Rho;
+RWStructuredBuffer<float>  _P;
+RWStructuredBuffer<float>  _Sleep; // sleep accumulator
+
+// Grid
+RWStructuredBuffer<uint>   _CellCount;   // [NumCells]
+RWStructuredBuffer<uint>   _CellList;    // [NumCells * MaxPerCell]
+
+// ---------------- RO aliases (SRV) ----------------
+StructuredBuffer<float3> _PosRO;
+StructuredBuffer<float3> _VelRO;
+StructuredBuffer<float>  _RhoRO;
+StructuredBuffer<float>  _PRO;
+StructuredBuffer<float>  _SleepRO;
+
+StructuredBuffer<uint>    _CellCountRO;
+StructuredBuffer<uint>    _CellListRO;
+
+cbuffer Params
+{
+    int   _NumParticles;
+
+    int   _Nx;
+    int   _Ny;
+    int   _Nz;
+    int   _NumCells;
+
+    float _CellSize;
+    int   _MaxPerCell;
+
+    float _Width;
+    float _Height;
+    float _Depth;
+
+    float _Dt;
+
+    // SPH params
+    float _H;
+    float _H2;
+    float _Mass;
+    float _Rho0;
+    float _K;        // pressure stiffness
+float _PressureMul; // extra scale for pressure forces (stability)
+float _NeighborMul;  // 0..1 shrink neighbor influence radius
+    float _Mu;
+    float _MuStaticMult; // viscosity multiplier when interacting with sleeping particles (absorbing boundary)
+    float _SleepInteractMul; // how strongly sleeping particles respond to awake neighbors (0..1)
+       // viscosity
+    float _Poly6C;
+    float _SpikyGradC;
+    float _ViscLapC;
+    float _G;        // gravity
+    float _Damp;     // velocity damping (0..1)
+
+    // repulsion (to prevent overlap)
+    float _RepR;
+    float _RepK;
+    float _RepDamp;
+
+    // blast
+    float _BlastX;
+    float _BlastY;
+    float _BlastZ;
+    float _BlastR;
+    float _BlastImpulse;
+
+    // freeze (sleep)
+    float _SleepVel;   // speed threshold
+    float _SleepTime;  // seconds below threshold to freeze
+    float _SleepYMax;  // freeze only below this height
+    float _WakeAcc;    // wake if |acc - g| is above (contact/impact)
+
+    // sleep criteria (from 3_GPU.py)
+    float _RhoSleepFrac; // rho >= rho0 * frac required to fall asleep
+    float _PWake;        // do not fall asleep if pressure above this
+    float _ForceSleepY;  // force-sleep everything below this Y (startup stabilize)
+    // wake if |acc| is above
+
+    float3 _WakeCenter;
+    float  _WakeRadius;
+};
+
+inline int clampi(int v, int lo, int hi) { return (v < lo) ? lo : (v > hi) ? hi : v; }
+
+inline uint CellIdFromPos(float3 p)
+{
+    int cx = (int)floor(p.x / _CellSize);
+    int cy = (int)floor(p.y / _CellSize);
+    int cz = (int)floor(p.z / _CellSize);
+
+    cx = clampi(cx, 0, _Nx - 1);
+    cy = clampi(cy, 0, _Ny - 1);
+    cz = clampi(cz, 0, _Nz - 1);
+
+    return (uint)(cz * (_Nx * _Ny) + cy * _Nx + cx);
+}
+
+// Poly6 kernel (3D): 315/(64*pi*h^9) * (h^2 - r^2)^3
+inline float W_poly6(float r2)
+{
+    if (r2 >= _H2) return 0.0;
+    float x = _H2 - r2;
+    return _Poly6C * x * x * x;
+}
+
+// Spiky gradient (3D): -45/(pi*h^6) * (h - r)^2 * (rvec/r)
+inline float3 gradW_spiky(float3 rvec, float r)
+{
+    if (r <= 1e-6 || r >= _H) return float3(0,0,0);
+    float x = _H - r;
+    return _SpikyGradC * (x * x) * (rvec / r);
+}
+
+// Viscosity laplacian (3D): 45/(pi*h^6) * (h - r)
+inline float lapW_visc(float r)
+{
+    if (r >= _H) return 0.0;
+    return _ViscLapC * (_H - r);
+}
+[numthreads(256,1,1)]
+void ClearCellCounts(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= (uint)_NumCells) return;
+    _CellCount[c] = 0u;
+}
+
+[numthreads(256,1,1)]
+void BuildCellLists(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_NumParticles) return;
+
+    uint cell = CellIdFromPos(_PosRO[i]);
+    uint idx;
+    InterlockedAdd(_CellCount[cell], 1u, idx);
+
+    if ((int)idx < _MaxPerCell)
+    {
+        _CellList[cell * (uint)_MaxPerCell + idx] = i;
+    }
+}
+
+// Density + pressure
+[numthreads(256,1,1)]
+void DensityPressure(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_NumParticles) return;
+
+    // sleeping particles act as static bed: no pressure buildup
+    if (_SleepRO[i] >= _SleepTime)
+    {
+        _Rho[i] = _Rho0;
+        _P[i] = 0.0;
+        return;
+    }
+
+    float3 pi = _PosRO[i];
+
+    int cx = (int)floor(pi.x / _CellSize);
+    int cy = (int)floor(pi.y / _CellSize);
+    int cz = (int)floor(pi.z / _CellSize);
+
+    float rho = 0.0;
+
+    [unroll] for (int dz = -1; dz <= 1; dz++)
+    [unroll] for (int dy = -1; dy <= 1; dy++)
+    [unroll] for (int dx = -1; dx <= 1; dx++)
+    {
+        int gx = cx + dx;
+        int gy = cy + dy;
+        int gz = cz + dz;
+        if (gx < 0 || gx >= _Nx || gy < 0 || gy >= _Ny || gz < 0 || gz >= _Nz) continue;
+
+        uint cell = (uint)(gz * (_Nx * _Ny) + gy * _Nx + gx);
+        uint cnt = _CellCountRO[cell];
+        uint n = min(cnt, (uint)_MaxPerCell);
+
+        for (uint k = 0u; k < n; k++)
+        {
+            uint j = _CellListRO[cell * (uint)_MaxPerCell + k];
+            float3 pj = _PosRO[j];
+            float3 r = pi - pj;
+            float r2 = dot(r, r);
+            rho += _Mass * W_poly6(r2);
+        }
+    }
+
+    // scale rho to usable range (because W_poly6 is unnormalized)
+    // For the demo, treat this as proportional density and re-normalize with rho0.
+    rho = max(rho, 1e-6);
+    _Rho[i] = rho;
+
+    float p = _K * max(rho - _Rho0, 0.0);
+    // Sleeping particles behave like static absorbing material: they don't carry pressure.
+    if (_SleepRO[i] >= _SleepTime) p = 0.0;
+    _P[i] = p;
+}
+
+// Forces
+[numthreads(256,1,1)]
+void Forces(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_NumParticles) return;
+
+    bool isleep = (_SleepRO[i] >= _SleepTime);
+    float3 pi = _PosRO[i];
+    float3 vi = _VelRO[i];
+
+    int cx = (int)floor(pi.x / _CellSize);
+    int cy = (int)floor(pi.y / _CellSize);
+    int cz = (int)floor(pi.z / _CellSize);
+
+    float rhoi = max(_RhoRO[i], 1e-6);
+    float piP = _PRO[i];
+
+    float3 acc = float3(0, -_G, 0);
+
+    [unroll] for (int dz = -1; dz <= 1; dz++)
+    [unroll] for (int dy = -1; dy <= 1; dy++)
+    [unroll] for (int dx = -1; dx <= 1; dx++)
+    {
+        int gx = cx + dx;
+        int gy = cy + dy;
+        int gz = cz + dz;
+        if (gx < 0 || gx >= _Nx || gy < 0 || gy >= _Ny || gz < 0 || gz >= _Nz) continue;
+
+        uint cell = (uint)(gz * (_Nx * _Ny) + gy * _Nx + gx);
+        uint cnt = _CellCountRO[cell];
+        uint n = min(cnt, (uint)_MaxPerCell);
+
+        for (uint k = 0u; k < n; k++)
+        {
+            uint j = _CellListRO[cell * (uint)_MaxPerCell + k];
+            if (j == i) continue;
+
+            float3 pj = _PosRO[j];
+            float3 rvec = pi - pj;
+            float r2 = dot(rvec, rvec);
+            if (r2 <= 1e-10 || r2 >= _H2) continue;
+
+            float r = sqrt(r2);
+            float rhoj = max(_RhoRO[j], 1e-6);
+            float pjP = _PRO[j];
+            bool jsleep = (_SleepRO[j] >= _SleepTime);
+
+            float3 gW = gradW_spiky(rvec, r);
+
+            if (isleep)
+            {
+                // Sleeping particles should not react to other sleeping particles (prevents global collapse).
+                // They only 'feel' nearby ACTIVE particles, and even then with reduced strength.
+                if (!jsleep)
+                {
+                    // Only neighbor pressure contributes (self pressure is clamped to 0 for sleep).
+                    float commonS = -_SleepInteractMul * _PressureMul * _Mass * (pjP / (rhoj * rhoj));
+                    acc += commonS * gW;
+                }
+            }
+            else
+            {
+                // Active particles: sleeping neighbors behave like static absorbing material (no pressure back).
+                if (jsleep) pjP = 0.0;
+
+                float common = -_PressureMul * _Mass * (piP / (rhoi * rhoi) + pjP / (rhoj * rhoj));
+                acc += common * gW;
+            }
+
+            // Viscosity
+            float3 vj = jsleep ? float3(0,0,0) : _VelRO[j];
+            float muScale = jsleep ? _MuStaticMult : 1.0;
+            if (isleep) muScale = 0.0; // sleeping particles don't accumulate viscosity for themselves
+
+            float lap = lapW_visc(r);
+            acc += (_Mu * muScale) * _Mass * lap * (vj - vi) / rhoj;
+
+            // Repulsion for overlap prevention
+            if (r < _RepR)
+            {
+                float3 nrm = rvec / r;
+                float pen = (_RepR - r);
+                float rvn = dot((vi - vj), nrm);
+                float f = _RepK * pen - _RepDamp * rvn;
+                acc += (f * nrm) / rhoi;
+            }
+        }
+    }
+
+    _Acc[i] = acc;
+}
+
+// Integrate + boundary
+[numthreads(256,1,1)]
+void Integrate(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_NumParticles) return;
+
+    // sleep / freeze
+    float sleep = _SleepRO[i];
+    // Sleeping particles stay perfectly still, but can be woken by strong contact/impact.
+    float3 gvec = float3(0,-_G,0);
+    float nonGravAcc = length(_Acc[i] - gvec);
+    if (sleep >= _SleepTime)
+    {
+        if (nonGravAcc > _WakeAcc)
+        {
+            _Sleep[i] = 0.0; // wake
+            sleep = 0.0;
+        }
+        else
+        {
+            _Vel[i] = float3(0,0,0);
+            _Acc[i] = float3(0,0,0);
+            _Sleep[i] = _SleepTime;
+            return;
+        }
+    }
+
+    float3 v = _Vel[i] + _Acc[i] * _Dt;
+    v *= _Damp;
+
+    float3 p = _Pos[i] + v * _Dt;
+
+    // bounds
+    if (p.x < 0.0) { p.x = 0.0; if (v.x < 0) v.x = 0; }
+    if (p.x > _Width) { p.x = _Width; if (v.x > 0) v.x = 0; }
+
+    if (p.z < 0.0) { p.z = 0.0; if (v.z < 0) v.z = 0; }
+    if (p.z > _Depth) { p.z = _Depth; if (v.z > 0) v.z = 0; }
+
+    // floor
+    if (p.y < 0.0) { p.y = 0.0; if (v.y < 0) v.y = 0; v.x *= 0.75; v.z *= 0.75; }
+    if (p.y > _Height) { p.y = _Height; if (v.y > 0) v.y = 0; }
+    // sleep accumulation handled in UpdateSleepSurfaceOnly
+    _Pos[i] = p;
+    _Vel[i] = v;
+}
+
+[numthreads(256,1,1)]
+void ApplyBlastImpulse(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_NumParticles) return;
+
+    float3 p = _PosRO[i];
+    float3 c = float3(_BlastX, _BlastY, _BlastZ);
+    float3 d = p - c;
+
+    float r2 = dot(d, d);
+    if (r2 > _BlastR * _BlastR) return;
+
+    float r = sqrt(max(r2, 1e-6));
+    float w = 1.0 - saturate(r / _BlastR);
+
+    float3 n = d / r;
+    _Vel[i] += n * (_BlastImpulse * w);
+    _Sleep[i] = 0.0; // wake
+}
+
+
+// ------------------------------------------------------------
+// ClearVelAcc: zero velocity/acceleration and clear sleep
+// ------------------------------------------------------------
+[numthreads(256,1,1)]
+void ClearVelAcc(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_NumParticles) return;
+    _Vel[i] = float3(0,0,0);
+    _Acc[i] = float3(0,0,0);
+    _Sleep[i] = 0.0;
+}
+
+
+// ------------------------------------------------------------
+// FreezeBed: mark particles below SleepYMax as sleeping and stop them
+// Useful to keep ground stable before pressing F.
+// ------------------------------------------------------------
+[numthreads(256,1,1)]
+void FreezeBed(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_NumParticles) return;
+
+    float3 p = _PosRO[i];
+    if (p.y <= _SleepYMax)
+    {
+        _Vel[i] = float3(0,0,0);
+        _Acc[i] = float3(0,0,0);
+        _Sleep[i] = _SleepTime;
+    }
+}
+
+
+// ------------------------------------------------------------
+// FreezeAll: mark ALL particles as sleeping and stop them
+// ------------------------------------------------------------
+[numthreads(256,1,1)]
+void FreezeAll(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_NumParticles) return;
+    _Vel[i] = float3(0,0,0);
+    _Acc[i] = float3(0,0,0);
+    _Sleep[i] = _SleepTime;
+}
+
+// ------------------------------------------------------------
+// ClearSleep: wake ALL particles (keep vel/acc untouched)
+// ------------------------------------------------------------
+[numthreads(256,1,1)]
+void ClearSleep(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_NumParticles) return;
+    _Sleep[i] = 0.0;
+}
+
+// ------------------------------------------------------------
+// WakeSphere: wake particles within a sphere (center/radius set from C#)
+// ------------------------------------------------------------
+[numthreads(256,1,1)]
+void WakeSphere(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_NumParticles) return;
+
+    float3 p = _PosRO[i];
+    float3 d = p - _WakeCenter;
+    if (dot(d,d) <= _WakeRadius * _WakeRadius)
+        _Sleep[i] = 0.0;
+}
+
+
+// ------------------------------------------------------------
+// UpdateSleepSurfaceOnly: falls asleep only near the ground surface (Y <= _SleepYMax)
+// Based on 3_GPU.py logic: need enough density and low speed for several frames.
+// Sleep is stored in _Sleep as a timer [0.._SleepTime].
+// ------------------------------------------------------------
+[numthreads(256,1,1)]
+void UpdateSleepSurfaceOnly(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_NumParticles) return;
+    float3 p = _PosRO[i];
+
+    // Do not freeze particles in the air (same idea as SLEEP_MAX_Y)
+    if (p.y > _SleepYMax)
+    {
+        _Sleep[i] = 0.0;
+        return;
+    }
+
+    float sleep = _SleepRO[i];
+
+    // If already sleeping, keep sleeping (waking handled in Integrate via contact accel)
+    if (sleep >= _SleepTime)
+    {
+        _Sleep[i] = _SleepTime;
+        _Vel[i] = float3(0,0,0);
+        return;
+    }
+
+    float rho = _RhoRO[i];
+    float pr  = _PRO[i];
+
+    // Need enough density to be considered "ground"
+    if (rho < _Rho0 * _RhoSleepFrac)
+    {
+        _Sleep[i] = 0.0;
+        return;
+    }
+
+    // Need low speed AND low pressure to freeze
+    float3 v = _VelRO[i];
+    float v2 = dot(v, v);
+    float vSleep2 = _SleepVel * _SleepVel;
+
+    if (v2 < vSleep2 && pr < _PWake)
+    {
+        sleep = min(_SleepTime, sleep + _Dt);
+        _Sleep[i] = sleep;
+        if (sleep >= _SleepTime)
+            _Vel[i] = float3(0,0,0);
+    }
+    else
+    {
+        _Sleep[i] = 0.0;
+    }
+}
+
+// ------------------------------------------------------------
+// ForceSleepBelowY: used after pre-settle to lock a stable ground volume (FORCE_SLEEP_Y)
+// ------------------------------------------------------------
+[numthreads(256,1,1)]
+void ForceSleepBelowY(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_NumParticles) return;
+    float y = _PosRO[i].y;
+    if (y <= _ForceSleepY)
+    {
+        _Sleep[i] = _SleepTime;
+        _Vel[i] = float3(0,0,0);
+        _Acc[i] = float3(0,0,0);
+    }
+}

@@ -1,0 +1,374 @@
+#pragma kernel ClearGrid
+#pragma kernel BuildGrid
+#pragma kernel DensityPressure
+#pragma kernel Integrate
+
+struct Particle
+{
+    float3 position;
+    float age;
+    float3 velocity;
+    float temperature;
+    float density;
+    float pressure;
+    float nearDensity;
+    float recentGroundContact;
+    float mass;
+    float active;
+    float pad0;
+    float pad1;
+};
+
+RWStructuredBuffer<Particle> _Particles;
+StructuredBuffer<int> _TerrainSolid;
+RWStructuredBuffer<int> _CellCounts;
+RWStructuredBuffer<int> _CellItems;
+
+int _ActiveCount;
+int3 _GridSize;
+int _GridCellCount;
+int _MaxParticlesPerCell;
+int3 _TerrainSize;
+float _TerrainCellSize;
+
+float _Dt;
+float _SmoothingRadius;
+float _ParticleRadius;
+float _ParticleSpacing;
+float _RestDensity;
+float _MinDensity;
+float _MaxDensity;
+float _GasConstant;
+float _PressureStrength;
+float _NearPressureStrength;
+float _CohesionStrength;
+float _XsphVelocityBlend;
+float _Viscosity;
+float _ColdViscosityMultiplier;
+float _ColdViscosityTemperature;
+float _HotViscosityTemperature;
+float _Gravity;
+float _Damping;
+float _CollisionFriction;
+float _MaxVelocity;
+float _MaxAcceleration;
+float _CoolingRate;
+float _GroundCoolingRate;
+float _WorldWidth;
+float _WorldHeight;
+float _WorldDepth;
+float _SemiSolidTemperature;
+float _SemiSolidViscosityMultiplier;
+float _SemiSolidVelocityDamping;
+float _SemiSolidGravityMultiplier;
+float _GroundTangentialDamping;
+float _GroundNormalDamping;
+float _GroundContactCoolingBoost;
+
+int CellIndex(int3 c)
+{
+    return c.x + c.y * _GridSize.x + c.z * _GridSize.x * _GridSize.y;
+}
+
+int3 ParticleCell(float3 p)
+{
+    int3 c = (int3)floor(p / max(_SmoothingRadius, 0.0001));
+    c = clamp(c, int3(0, 0, 0), _GridSize - int3(1, 1, 1));
+    return c;
+}
+
+int TerrainIndex(int3 c)
+{
+    return c.x + c.y * _TerrainSize.x + c.z * _TerrainSize.x * _TerrainSize.y;
+}
+
+bool TerrainSolid(int3 c)
+{
+    if (any(c < int3(0, 0, 0)) || c.x >= _TerrainSize.x || c.y >= _TerrainSize.y || c.z >= _TerrainSize.z) return false;
+    return _TerrainSolid[TerrainIndex(c)] != 0;
+}
+
+float3 Clamp3(float3 v, float3 lo, float3 hi)
+{
+    return min(max(v, lo), hi);
+}
+
+void ApplyGroundLoss(inout Particle p, float dt)
+{
+    p.recentGroundContact = 0.45;
+    p.temperature = max(0.0, p.temperature - _GroundCoolingRate * _GroundContactCoolingBoost * dt);
+}
+
+[numthreads(128,1,1)]
+void ClearGrid(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_GridCellCount) return;
+    _CellCounts[i] = 0;
+}
+
+[numthreads(128,1,1)]
+void BuildGrid(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_ActiveCount) return;
+    Particle p = _Particles[i];
+    if (p.active < 0.5) return;
+
+    int cell = CellIndex(ParticleCell(p.position));
+    int slot;
+    InterlockedAdd(_CellCounts[cell], 1, slot);
+    if (slot < _MaxParticlesPerCell)
+    {
+        _CellItems[cell * _MaxParticlesPerCell + slot] = (int)i;
+    }
+}
+
+[numthreads(128,1,1)]
+void DensityPressure(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_ActiveCount) return;
+    Particle p = _Particles[i];
+    if (p.active < 0.5) return;
+
+    float h = max(_SmoothingRadius, 0.0001);
+    float density = 0.0;
+    float nearDensity = 0.0;
+    int3 baseCell = ParticleCell(p.position);
+
+    [loop]
+    for (int dz = -1; dz <= 1; dz++)
+    [loop]
+    for (int dy = -1; dy <= 1; dy++)
+    [loop]
+    for (int dx = -1; dx <= 1; dx++)
+    {
+        int3 nc = baseCell + int3(dx, dy, dz);
+        if (any(nc < int3(0,0,0)) || any(nc >= _GridSize)) continue;
+        int ci = CellIndex(nc);
+        int count = min(_CellCounts[ci], _MaxParticlesPerCell);
+        [loop]
+        for (int n = 0; n < count; n++)
+        {
+            int qi = _CellItems[ci * _MaxParticlesPerCell + n];
+            Particle q = _Particles[qi];
+            float3 d = p.position - q.position;
+            float r2 = dot(d, d);
+            if (r2 >= h * h) continue;
+            float r = sqrt(max(r2, 0.0000001));
+            float qn = saturate(1.0 - r / h);
+            density += q.mass * qn * qn * qn;
+            nearDensity += qn * qn * qn * qn;
+        }
+    }
+
+    p.density = clamp(density, _MinDensity, _MaxDensity);
+    p.nearDensity = nearDensity;
+    p.pressure = max(0.0, _GasConstant * (p.density - _RestDensity));
+    _Particles[i] = p;
+}
+
+[numthreads(128,1,1)]
+void Integrate(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_ActiveCount) return;
+    Particle p = _Particles[i];
+    if (p.active < 0.5) return;
+
+    float dt = _Dt;
+    float h = max(_SmoothingRadius, 0.0001);
+    bool semiSolid = p.temperature <= _SemiSolidTemperature;
+    float gravityMul = semiSolid ? _SemiSolidGravityMultiplier : 1.0;
+    float3 acc = float3(0.0, -_Gravity * gravityMul, 0.0);
+
+    int3 baseCell = ParticleCell(p.position);
+    [loop]
+    for (int dz = -1; dz <= 1; dz++)
+    [loop]
+    for (int dy = -1; dy <= 1; dy++)
+    [loop]
+    for (int dx = -1; dx <= 1; dx++)
+    {
+        int3 nc = baseCell + int3(dx, dy, dz);
+        if (any(nc < int3(0,0,0)) || any(nc >= _GridSize)) continue;
+        int ci = CellIndex(nc);
+        int count = min(_CellCounts[ci], _MaxParticlesPerCell);
+        [loop]
+        for (int n = 0; n < count; n++)
+        {
+            int qi = _CellItems[ci * _MaxParticlesPerCell + n];
+            if (qi == (int)i) continue;
+            Particle q = _Particles[qi];
+            if (q.active < 0.5) continue;
+            float3 diff = p.position - q.position;
+            float r2 = dot(diff, diff);
+            if (r2 <= 0.0000001 || r2 >= h * h) continue;
+            float r = sqrt(r2);
+            float3 dir = diff / r;
+            float qn = saturate(1.0 - r / h);
+
+            float pressurePair = (p.pressure + q.pressure) * 0.5;
+            acc += dir * (_PressureStrength * pressurePair * qn * qn / max(_MinDensity, q.density));
+
+            // Near pressure now acts through the full smoothing radius, not only inside
+            // particle spacing. This makes particle-particle interaction visible earlier.
+            float nearPair = (p.nearDensity + q.nearDensity) * 0.5;
+            float nearKernelWide = qn * qn * qn;
+            acc += dir * (_NearPressureStrength * nearPair * nearKernelWide / max(_MinDensity, q.density));
+
+            float spacing = min(max(_ParticleSpacing, _ParticleRadius * 2.0), h * 0.98);
+            if (r < spacing)
+            {
+                float sn = saturate(1.0 - r / spacing);
+                float nearKernelContact = sn * sn * (2.0 - sn);
+                acc += dir * (_NearPressureStrength * 0.55 * nearPair * nearKernelContact / max(_MinDensity, q.density));
+            }
+            else
+            {
+                // Weak cohesion outside direct contact, so the hot phase behaves less like sand
+                // and more like a connected viscous liquid sheet.
+                float denom = max(0.0001, h - spacing);
+                float ct = saturate((r - spacing) / denom);
+                float cohesionKernel = ct * (1.0 - ct) * 4.0;
+                acc -= dir * (_CohesionStrength * cohesionKernel * q.mass / max(_MinDensity, q.density));
+            }
+
+            float pairTemp = (p.temperature + q.temperature) * 0.5;
+            float tempT = saturate((pairTemp - _ColdViscosityTemperature) / max(0.0001, _HotViscosityTemperature - _ColdViscosityTemperature));
+            float pairVisc = _Viscosity * lerp(_ColdViscosityMultiplier, 1.0, tempT);
+            if (semiSolid || q.temperature <= _SemiSolidTemperature) pairVisc *= _SemiSolidViscosityMultiplier;
+            acc += (q.velocity - p.velocity) * (pairVisc * qn / max(1.0, q.density));
+        }
+    }
+
+    float accLen = length(acc);
+    if (accLen > _MaxAcceleration) acc = acc / accLen * _MaxAcceleration;
+
+    p.velocity += acc * dt;
+
+    // XSPH-like neighbour velocity blending. This is not collider contact; it is
+    // a fluid-style particle interaction that makes nearby particles drag each other.
+    float3 xsph = float3(0.0, 0.0, 0.0);
+    float xsphW = 0.0;
+    [loop]
+    for (int dz2 = -1; dz2 <= 1; dz2++)
+    [loop]
+    for (int dy2 = -1; dy2 <= 1; dy2++)
+    [loop]
+    for (int dx2 = -1; dx2 <= 1; dx2++)
+    {
+        int3 nc2 = baseCell + int3(dx2, dy2, dz2);
+        if (any(nc2 < int3(0,0,0)) || any(nc2 >= _GridSize)) continue;
+        int ci2 = CellIndex(nc2);
+        int count2 = min(_CellCounts[ci2], _MaxParticlesPerCell);
+        [loop]
+        for (int n2 = 0; n2 < count2; n2++)
+        {
+            int qi2 = _CellItems[ci2 * _MaxParticlesPerCell + n2];
+            if (qi2 == (int)i) continue;
+            Particle q2 = _Particles[qi2];
+            if (q2.active < 0.5) continue;
+            float3 d2 = q2.position - p.position;
+            float rr2 = dot(d2, d2);
+            if (rr2 <= 0.0000001 || rr2 >= h * h) continue;
+            float rr = sqrt(rr2);
+            float w = saturate(1.0 - rr / h);
+            xsph += (q2.velocity - p.velocity) * w;
+            xsphW += w;
+        }
+    }
+    if (xsphW > 0.0001)
+    {
+        p.velocity += (xsph / xsphW) * saturate(_XsphVelocityBlend) * saturate(dt * 8.0);
+    }
+
+    p.velocity *= pow(_Damping, dt * 60.0);
+    if (semiSolid) p.velocity *= lerp(1.0, _SemiSolidVelocityDamping, saturate(dt * 10.0));
+
+    float speed = length(p.velocity);
+    if (speed > _MaxVelocity) p.velocity = p.velocity / speed * _MaxVelocity;
+
+    p.position += p.velocity * dt;
+    p.age += dt;
+    p.recentGroundContact = max(0.0, p.recentGroundContact - dt);
+    p.temperature = max(0.0, p.temperature - _CoolingRate * dt);
+
+    float r = _ParticleRadius;
+    if (p.position.x < r) { p.position.x = r; if (p.velocity.x < 0.0) p.velocity.x = 0.0; }
+    if (p.position.x > _WorldWidth - r) { p.position.x = _WorldWidth - r; if (p.velocity.x > 0.0) p.velocity.x = 0.0; }
+    if (p.position.z < r) { p.position.z = r; if (p.velocity.z < 0.0) p.velocity.z = 0.0; }
+    if (p.position.z > _WorldDepth - r) { p.position.z = _WorldDepth - r; if (p.velocity.z > 0.0) p.velocity.z = 0.0; }
+    if (p.position.y < r)
+    {
+        p.position.y = r;
+        if (p.velocity.y < 0.0) p.velocity.y = 0.0;
+        ApplyGroundLoss(p, dt);
+    }
+    if (p.position.y > _WorldHeight)
+    {
+        p.position.y = _WorldHeight;
+        if (p.velocity.y > 0.0) p.velocity.y = 0.0;
+    }
+
+    float search = r + _TerrainCellSize;
+    float3 search3 = float3(search, search, search);
+    int3 minC = (int3)floor((p.position - search3) / _TerrainCellSize);
+    int3 maxC = (int3)floor((p.position + search3) / _TerrainCellSize);
+
+    [loop]
+    for (int z = minC.z; z <= maxC.z; z++)
+    [loop]
+    for (int y = minC.y; y <= maxC.y; y++)
+    [loop]
+    for (int x = minC.x; x <= maxC.x; x++)
+    {
+        int3 tc = int3(x, y, z);
+        if (!TerrainSolid(tc)) continue;
+        float3 bmin = float3(x, y, z) * _TerrainCellSize;
+        float3 bmax = bmin + float3(_TerrainCellSize, _TerrainCellSize, _TerrainCellSize);
+        float3 closest = Clamp3(p.position, bmin, bmax);
+        float3 delta = p.position - closest;
+        float dist2 = dot(delta, delta);
+        if (dist2 >= r * r) continue;
+
+        float3 normal;
+        float penetration;
+        if (dist2 > 0.0000001)
+        {
+            float dist = sqrt(dist2);
+            normal = delta / dist;
+            penetration = r - dist;
+        }
+        else
+        {
+            float3 center = (bmin + bmax) * 0.5;
+            float3 local = p.position - center;
+            float3 a = abs(local);
+            if (a.x >= a.y && a.x >= a.z) normal = float3(local.x >= 0.0 ? 1.0 : -1.0, 0.0, 0.0);
+            else if (a.y >= a.x && a.y >= a.z) normal = float3(0.0, local.y >= 0.0 ? 1.0 : -1.0, 0.0);
+            else normal = float3(0.0, 0.0, local.z >= 0.0 ? 1.0 : -1.0);
+            penetration = r;
+        }
+
+        p.position += normal * (penetration + 0.0005);
+        float vn = dot(p.velocity, normal);
+        if (vn < 0.0)
+        {
+            float3 normalVelocity = normal * vn;
+            float3 tangentVelocity = p.velocity - normalVelocity;
+            if (normal.y > 0.35)
+            {
+                p.velocity = tangentVelocity * _GroundTangentialDamping + normalVelocity * _GroundNormalDamping;
+                ApplyGroundLoss(p, dt);
+            }
+            else
+            {
+                p.velocity = tangentVelocity * _CollisionFriction;
+            }
+        }
+    }
+
+    _Particles[i] = p;
+}
