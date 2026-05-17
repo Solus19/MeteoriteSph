@@ -14,6 +14,7 @@ namespace MeteoriteSPH3D
             if (keyboard == null) return false;
 
             if (key == KeyCode.R) return keyboard.rKey.wasPressedThisFrame;
+            if (key == KeyCode.S) return keyboard.sKey.wasPressedThisFrame;
             if (key == KeyCode.Space) return keyboard.spaceKey.wasPressedThisFrame;
             if (key == KeyCode.M) return keyboard.mKey.wasPressedThisFrame;
             if (key == KeyCode.F1) return keyboard.f1Key.wasPressedThisFrame;
