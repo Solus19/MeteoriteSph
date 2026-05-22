@@ -1,6 +1,8 @@
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using Unity.Collections;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace MeteoriteSPH3D
 {
@@ -26,16 +28,25 @@ namespace MeteoriteSPH3D
         public ComputeBuffer ParticleBuffer { get { return particleBuffer; } }
         public int ActiveCount { get; private set; }
         public bool IsReady { get { return compute != null && particleBuffer != null && terrainSolidBuffer != null; } }
+        public bool SupportsAsyncReadback { get { return SystemInfo.supportsAsyncGPUReadback; } }
+        public bool IsReadbackPending { get { return readbackPending; } }
 
         private ComputeShader compute;
         private ComputeBuffer particleBuffer;
         private ComputeBuffer terrainSolidBuffer;
         private ComputeBuffer cellCountsBuffer;
         private ComputeBuffer cellItemsBuffer;
+        private ComputeBuffer deactivateIndexBuffer;
 
         private GPUParticle[] particleCache;
         private int[] terrainSolidCache;
-        private readonly uint[] clearArgs = new uint[3];
+        private int[] deactivateIndexCache;
+
+        private bool readbackPending;
+        private AsyncGPUReadbackRequest readbackRequest;
+        private int readbackCount;
+        private int readbackUploadVersion;
+        private int uploadVersion;
 
         private int maxParticles;
         private int maxPerCell;
@@ -48,6 +59,7 @@ namespace MeteoriteSPH3D
         private int kBuild;
         private int kDensity;
         private int kIntegrate;
+        private int kDeactivate;
 
         public void Initialize(MeteoriteSPH3DController c, VoxelTerrain3D terrain)
         {
@@ -74,16 +86,21 @@ namespace MeteoriteSPH3D
             terrainSolidBuffer = new ComputeBuffer(terrain.Width * terrain.Height * terrain.Depth, sizeof(int), ComputeBufferType.Structured);
             cellCountsBuffer = new ComputeBuffer(gridCellCount, sizeof(int), ComputeBufferType.Structured);
             cellItemsBuffer = new ComputeBuffer(gridCellCount * maxPerCell, sizeof(int), ComputeBufferType.Structured);
+            deactivateIndexBuffer = new ComputeBuffer(maxParticles, sizeof(int), ComputeBufferType.Structured);
+            deactivateIndexCache = new int[maxParticles];
 
             kClear = compute.FindKernel("ClearGrid");
             kBuild = compute.FindKernel("BuildGrid");
             kDensity = compute.FindKernel("DensityPressure");
             kIntegrate = compute.FindKernel("Integrate");
+            kDeactivate = compute.FindKernel("DeactivateParticles");
 
             BindBuffers(kClear);
             BindBuffers(kBuild);
             BindBuffers(kDensity);
             BindBuffers(kIntegrate);
+            BindBuffers(kDeactivate);
+            compute.SetBuffer(kDeactivate, "_DeactivateIndices", deactivateIndexBuffer);
 
             compute.SetInts("_GridSize", gridX, gridY, gridZ);
             compute.SetInt("_GridCellCount", gridCellCount);
@@ -101,13 +118,20 @@ namespace MeteoriteSPH3D
             if (terrainSolidBuffer != null) terrainSolidBuffer.Release();
             if (cellCountsBuffer != null) cellCountsBuffer.Release();
             if (cellItemsBuffer != null) cellItemsBuffer.Release();
+            if (deactivateIndexBuffer != null) deactivateIndexBuffer.Release();
             particleBuffer = null;
             terrainSolidBuffer = null;
             cellCountsBuffer = null;
             cellItemsBuffer = null;
+            deactivateIndexBuffer = null;
             compute = null;
             particleCache = null;
             terrainSolidCache = null;
+            deactivateIndexCache = null;
+            readbackPending = false;
+            readbackCount = 0;
+            readbackUploadVersion = 0;
+            uploadVersion++;
             ActiveCount = 0;
         }
 
@@ -163,6 +187,7 @@ namespace MeteoriteSPH3D
                     g.recentGroundContact = p.recentGroundContact;
                     g.mass = p.mass;
                     g.active = 1f;
+                    p.gpuIndex = ActiveCount;
                     particleCache[ActiveCount++] = g;
                 }
 
@@ -173,6 +198,53 @@ namespace MeteoriteSPH3D
             }
 
             particleBuffer.SetData(particleCache);
+            uploadVersion++;
+        }
+
+        public bool RequestParticleReadback()
+        {
+            if (!SupportsAsyncReadback || particleBuffer == null || ActiveCount <= 0 || readbackPending) return false;
+            int stride = Marshal.SizeOf(typeof(GPUParticle));
+            readbackCount = Mathf.Clamp(ActiveCount, 0, maxParticles);
+            readbackUploadVersion = uploadVersion;
+            readbackRequest = AsyncGPUReadback.Request(particleBuffer, readbackCount * stride, 0);
+            readbackPending = true;
+            return true;
+        }
+
+        public bool TryConsumeParticleReadback(List<SPHParticle3D> particles)
+        {
+            if (!readbackPending) return false;
+            if (!readbackRequest.done) return false;
+
+            readbackPending = false;
+            if (particles == null) return false;
+
+            if (readbackRequest.hasError || readbackUploadVersion != uploadVersion)
+            {
+                return false;
+            }
+
+            NativeArray<GPUParticle> data = readbackRequest.GetData<GPUParticle>();
+            particles.Clear();
+            int count = Mathf.Min(readbackCount, data.Length);
+            for (int i = 0; i < count; i++)
+            {
+                GPUParticle g = data[i];
+                if (g.active < 0.5f) continue;
+                SPHParticle3D p = new SPHParticle3D(g.position, g.velocity, g.temperature, g.mass);
+                p.age = g.age;
+                p.density = g.density;
+                p.pressure = g.pressure;
+                p.recentGroundContact = g.recentGroundContact;
+                p.gpuIndex = i;
+                particles.Add(p);
+            }
+
+            // Keep ActiveCount equal to the GPU buffer prefix length. Async deactivation can leave inactive holes;
+            // shrinking ActiveCount here would make later deactivation indices point at wrong slots.
+            ActiveCount = Mathf.Min(maxParticles, readbackCount);
+            return true;
         }
 
         public void DownloadToParticles(List<SPHParticle3D> particles)
@@ -181,9 +253,11 @@ namespace MeteoriteSPH3D
             if (ActiveCount <= 0)
             {
                 particles.Clear();
+                readbackPending = false;
                 return;
             }
 
+            readbackPending = false;
             particleBuffer.GetData(particleCache, 0, 0, ActiveCount);
             particles.Clear();
             for (int i = 0; i < ActiveCount; i++)
@@ -195,9 +269,31 @@ namespace MeteoriteSPH3D
                 p.density = g.density;
                 p.pressure = g.pressure;
                 p.recentGroundContact = g.recentGroundContact;
+                p.gpuIndex = i;
                 particles.Add(p);
             }
             ActiveCount = Mathf.Min(maxParticles, particles.Count);
+        }
+
+
+        public void DeactivateParticles(List<int> gpuIndices)
+        {
+            if (!IsReady || deactivateIndexBuffer == null || deactivateIndexCache == null || gpuIndices == null || gpuIndices.Count == 0) return;
+
+            int count = 0;
+            for (int i = 0; i < gpuIndices.Count && count < maxParticles; i++)
+            {
+                int idx = gpuIndices[i];
+                if (idx < 0 || idx >= ActiveCount) continue;
+                deactivateIndexCache[count++] = idx;
+            }
+
+            if (count <= 0) return;
+
+            deactivateIndexBuffer.SetData(deactivateIndexCache, 0, 0, count);
+            compute.SetInt("_DeactivateCount", count);
+            int groups = Mathf.CeilToInt(count / 128f);
+            compute.Dispatch(kDeactivate, groups, 1, 1);
         }
 
         public void Step(MeteoriteSPH3DController c, VoxelTerrain3D terrain, float dt)

@@ -40,7 +40,11 @@ namespace MeteoriteSPH3D
             }
 
             Shader gpuShader = Shader.Find("MeteoriteSPH3D/ParticleGPUInstanced");
-            if (gpuShader != null) gpuMaterial = new Material(gpuShader);
+            if (gpuShader != null)
+            {
+                gpuMaterial = new Material(gpuShader);
+                gpuMaterial.enableInstancing = true;
+            }
             argsBuffer = new ComputeBuffer(1, args.Length * sizeof(uint), ComputeBufferType.IndirectArguments);
             args[0] = sphereMesh != null ? sphereMesh.GetIndexCount(0) : 0;
             args[1] = 0;
@@ -100,7 +104,16 @@ namespace MeteoriteSPH3D
             float h = (c.terrainHeight * c.cellSize) + c.extraWorldHeight + 10f;
             float d = c.terrainDepth * c.cellSize;
             Bounds bounds = new Bounds(new Vector3(w * 0.5f, h * 0.5f, d * 0.5f), new Vector3(w + 20f, h + 20f, d + 20f));
-            Graphics.DrawMeshInstancedIndirect(sphereMesh, 0, gpuMaterial, bounds, argsBuffer);
+            Graphics.DrawMeshInstancedIndirect(
+                sphereMesh,
+                0,
+                gpuMaterial,
+                bounds,
+                argsBuffer,
+                0,
+                null,
+                ShadowCastingMode.Off,
+                false);
         }
 
         private void Draw(List<SPHParticle3D> particles)

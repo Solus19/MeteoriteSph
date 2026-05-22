@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace MeteoriteSPH3D
@@ -15,6 +16,18 @@ namespace MeteoriteSPH3D
         public float WorldDepth { get { return Depth * CellSize; } }
 
         public int SolidCount { get; private set; }
+        public bool HasDirtyBounds { get { return dirtyBoundsValid; } }
+
+        private readonly List<int> thermalIndices = new List<int>(4096);
+        private readonly bool[] thermalQueued;
+
+        private bool dirtyBoundsValid;
+        private int dirtyMinX;
+        private int dirtyMinY;
+        private int dirtyMinZ;
+        private int dirtyMaxX;
+        private int dirtyMaxY;
+        private int dirtyMaxZ;
 
         public VoxelTerrain3D(int width, int height, int depth, float cellSize)
         {
@@ -23,6 +36,7 @@ namespace MeteoriteSPH3D
             Depth = Mathf.Max(4, depth);
             CellSize = Mathf.Max(0.05f, cellSize);
             Cells = new VoxelCell3D[Width * Height * Depth];
+            thermalQueued = new bool[Cells.Length];
         }
 
         public int Index(int x, int y, int z)
@@ -47,11 +61,15 @@ namespace MeteoriteSPH3D
 
         public void Set(int x, int y, int z, VoxelCell3D cell)
         {
+            if (!InBounds(x, y, z)) return;
             int i = Index(x, y, z);
             bool wasSolid = Cells[i].solid;
+            cell.damage = Mathf.Clamp01(cell.damage);
             Cells[i] = cell;
             if (!wasSolid && cell.solid) SolidCount++;
             if (wasSolid && !cell.solid) SolidCount--;
+            MarkDirtyVoxel(x, y, z);
+            QueueThermalIfNeeded(i, cell);
         }
 
         public void SetSolid(int x, int y, int z, bool solid, float temperature, float pressure, float damage, bool deposited = false)
@@ -60,17 +78,20 @@ namespace MeteoriteSPH3D
             int i = Index(x, y, z);
             bool wasSolid = Cells[i].solid;
             Cells[i].solid = solid;
-            Cells[i].temperature = temperature;
-            Cells[i].pressure = pressure;
-            Cells[i].damage = damage;
+            Cells[i].temperature = Mathf.Max(0f, temperature);
+            Cells[i].pressure = Mathf.Max(0f, pressure);
+            Cells[i].damage = Mathf.Clamp01(damage);
             Cells[i].deposited = deposited;
 
             if (!wasSolid && solid) SolidCount++;
             if (wasSolid && !solid) SolidCount--;
+            MarkDirtyVoxel(x, y, z);
+            QueueThermalIfNeeded(i, Cells[i]);
         }
 
         public void GenerateFlat(int baseHeight)
         {
+            ClearThermalState();
             SolidCount = 0;
             baseHeight = Mathf.Clamp(baseHeight, 1, Height - 2);
 
@@ -93,10 +114,13 @@ namespace MeteoriteSPH3D
                     }
                 }
             }
+
+            MarkAllDirty();
         }
 
         public void GenerateRelief(int baseHeight, int amplitudeCells, float noiseScale, int seed)
         {
+            ClearThermalState();
             SolidCount = 0;
             baseHeight = Mathf.Clamp(baseHeight, 1, Height - 2);
             amplitudeCells = Mathf.Clamp(amplitudeCells, 0, Mathf.Max(0, Height / 2));
@@ -121,10 +145,10 @@ namespace MeteoriteSPH3D
                     float radial = Mathf.Sqrt(dx * dx + dz * dz);
 
                     float dome = Mathf.Clamp01(1f - radial * 0.92f);
-                    dome = dome * dome * (3f - 2f * dome); // smoothstep-like
+                    dome = dome * dome * (3f - 2f * dome);
                     float cone = Mathf.Clamp01(1f - radial * 1.05f);
                     float peak = Mathf.Clamp01(1f - radial * 1.85f);
-                    peak = peak * peak;
+                    peak *= peak;
                     float shoulder = Mathf.Clamp01(1f - radial * 0.62f);
 
                     float n1 = Mathf.PerlinNoise(nx + seedA, nz + seedB) - 0.5f;
@@ -147,7 +171,6 @@ namespace MeteoriteSPH3D
                 }
             }
 
-            // Light smoothing so the central mountain stays readable, but with a clear single peak.
             int[] smooth = new int[heightMap.Length];
             for (int z = 0; z < Depth; z++)
             {
@@ -188,6 +211,8 @@ namespace MeteoriteSPH3D
                     }
                 }
             }
+
+            MarkAllDirty();
         }
 
         public Vector3 CellCenter(int x, int y, int z)
@@ -222,18 +247,98 @@ namespace MeteoriteSPH3D
             return SolidNeighbourCount6(x, y, z) >= requiredNeighbours;
         }
 
+        public void MarkDirtyVoxel(int x, int y, int z)
+        {
+            if (!InBounds(x, y, z)) return;
+            if (!dirtyBoundsValid)
+            {
+                dirtyBoundsValid = true;
+                dirtyMinX = dirtyMaxX = x;
+                dirtyMinY = dirtyMaxY = y;
+                dirtyMinZ = dirtyMaxZ = z;
+                return;
+            }
+
+            if (x < dirtyMinX) dirtyMinX = x;
+            if (y < dirtyMinY) dirtyMinY = y;
+            if (z < dirtyMinZ) dirtyMinZ = z;
+            if (x > dirtyMaxX) dirtyMaxX = x;
+            if (y > dirtyMaxY) dirtyMaxY = y;
+            if (z > dirtyMaxZ) dirtyMaxZ = z;
+        }
+
+        public void MarkAllDirty()
+        {
+            dirtyBoundsValid = true;
+            dirtyMinX = 0;
+            dirtyMinY = 0;
+            dirtyMinZ = 0;
+            dirtyMaxX = Width - 1;
+            dirtyMaxY = Height - 1;
+            dirtyMaxZ = Depth - 1;
+        }
+
+        public bool ConsumeDirtyBounds(out int minX, out int minY, out int minZ, out int maxX, out int maxY, out int maxZ)
+        {
+            if (!dirtyBoundsValid)
+            {
+                minX = minY = minZ = maxX = maxY = maxZ = 0;
+                return false;
+            }
+
+            minX = dirtyMinX;
+            minY = dirtyMinY;
+            minZ = dirtyMinZ;
+            maxX = dirtyMaxX;
+            maxY = dirtyMaxY;
+            maxZ = dirtyMaxZ;
+            dirtyBoundsValid = false;
+            return true;
+        }
+
         public void CoolVoxels(float dt, float coolingRate)
         {
             float cool = Mathf.Max(0f, coolingRate) * dt;
-            for (int i = 0; i < Cells.Length; i++)
+            if (cool <= 0f || thermalIndices.Count == 0) return;
+
+            for (int t = thermalIndices.Count - 1; t >= 0; t--)
             {
-                if (!Cells[i].solid) continue;
+                int i = thermalIndices[t];
                 VoxelCell3D c = Cells[i];
+
+                if (!c.solid && c.temperature <= 0f && c.pressure <= 0f)
+                {
+                    thermalQueued[i] = false;
+                    thermalIndices.RemoveAt(t);
+                    continue;
+                }
+
                 c.temperature = Mathf.Max(0f, c.temperature - cool);
                 c.pressure = Mathf.Max(0f, c.pressure - cool * 1.5f);
                 c.damage = Mathf.Clamp01(c.damage);
                 Cells[i] = c;
+
+                if (c.temperature <= 0f && c.pressure <= 0f)
+                {
+                    thermalQueued[i] = false;
+                    thermalIndices.RemoveAt(t);
+                }
             }
+        }
+
+        private void QueueThermalIfNeeded(int index, VoxelCell3D cell)
+        {
+            if (cell.temperature <= 0f && cell.pressure <= 0f) return;
+            if (thermalQueued[index]) return;
+            thermalQueued[index] = true;
+            thermalIndices.Add(index);
+        }
+
+        private void ClearThermalState()
+        {
+            thermalIndices.Clear();
+            System.Array.Clear(thermalQueued, 0, thermalQueued.Length);
+            dirtyBoundsValid = false;
         }
     }
 }

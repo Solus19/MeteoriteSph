@@ -15,6 +15,8 @@ namespace MeteoriteSPH3D
         public float age;
         public float recentGroundContact;
         public bool active;
+        // GPU buffer slot for async readback/deactivation. -1 means CPU-only particle.
+        public int gpuIndex;
 
         public SPHParticle3D(Vector3 position, Vector3 velocity, float temperature, float mass)
         {
@@ -28,6 +30,7 @@ namespace MeteoriteSPH3D
             age = 0f;
             recentGroundContact = 0f;
             active = true;
+            gpuIndex = -1;
         }
     }
 }

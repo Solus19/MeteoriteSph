@@ -2,6 +2,7 @@
 #pragma kernel BuildGrid
 #pragma kernel DensityPressure
 #pragma kernel Integrate
+#pragma kernel DeactivateParticles
 
 struct Particle
 {
@@ -23,6 +24,8 @@ RWStructuredBuffer<Particle> _Particles;
 StructuredBuffer<int> _TerrainSolid;
 RWStructuredBuffer<int> _CellCounts;
 RWStructuredBuffer<int> _CellItems;
+StructuredBuffer<int> _DeactivateIndices;
+int _DeactivateCount;
 
 int _ActiveCount;
 int3 _GridSize;
@@ -371,4 +374,22 @@ void Integrate(uint3 id : SV_DispatchThreadID)
     }
 
     _Particles[i] = p;
+}
+
+
+[numthreads(128, 1, 1)]
+void DeactivateParticles(uint3 id : SV_DispatchThreadID)
+{
+    uint n = id.x;
+    if (n >= (uint)_DeactivateCount) return;
+
+    int particleIndex = _DeactivateIndices[n];
+    if (particleIndex < 0 || particleIndex >= _ActiveCount) return;
+
+    Particle p = _Particles[particleIndex];
+    p.active = 0.0;
+    p.velocity = float3(0.0, 0.0, 0.0);
+    p.temperature = 0.0;
+    p.position = float3(-100000.0, -100000.0, -100000.0);
+    _Particles[particleIndex] = p;
 }

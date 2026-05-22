@@ -57,22 +57,27 @@ Shader "MeteoriteSPH3D/ParticleGPUInstanced"
                 float3 normal : TEXCOORD0;
                 float temp : TEXCOORD1;
                 float3 worldPos : TEXCOORD2;
+                float active : TEXCOORD3;
             };
 
             v2f vert(appdata v)
             {
                 Particle p = _Particles[v.instanceID];
-                float3 world = p.position + v.vertex.xyz * (_Radius * 2.0);
+                float active = step(0.5, p.active);
+                float3 world = p.position + v.vertex.xyz * (_Radius * 2.0 * active);
+                world = lerp(float3(-100000.0, -100000.0, -100000.0), world, active);
                 v2f o;
                 o.pos = mul(UNITY_MATRIX_VP, float4(world, 1.0));
                 o.normal = normalize(v.normal);
                 o.temp = p.temperature;
                 o.worldPos = p.position;
+                o.active = p.active;
                 return o;
             }
 
             fixed4 frag(v2f i) : SV_Target
             {
+                if (i.active < 0.5) discard;
                 if (_LayerViewEnabled != 0)
                 {
                     float coord = i.worldPos.y;

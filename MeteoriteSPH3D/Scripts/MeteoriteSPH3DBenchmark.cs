@@ -3,6 +3,7 @@ using System.Globalization;
 using System.IO;
 using System.Text;
 using UnityEngine;
+using UnityEngine.Profiling;
 
 namespace MeteoriteSPH3D
 {
@@ -85,7 +86,7 @@ namespace MeteoriteSPH3D
             CurrentFilePath = Path.Combine(dir, fileName);
 
             writer = new StreamWriter(CurrentFilePath, false, new UTF8Encoding(false));
-            writer.WriteLine("event,time_s,realtime_s,frame,frame_ms_avg,frame_ms_last,frame_ms_max,fps_avg,active_particles,solid_voxels,use_gpu,last_created,total_created,last_solidified,total_solidified,controller_update_ms,gpu_sim_ms,cpu_sim_ms,gpu_readback_ms,solidify_ms,gpu_terrain_upload_ms,gpu_particle_upload_ms,mesh_rebuild_ms,terrain_width,terrain_height,terrain_depth,max_particles");
+            writer.WriteLine("event,time_s,realtime_s,frame,frame_ms_avg,frame_ms_last,frame_ms_max,fps_avg,active_particles,solid_voxels,use_gpu,last_created,total_created,last_solidified,total_solidified,controller_update_ms,gpu_sim_ms,cpu_sim_ms,gpu_readback_ms,solidify_ms,gpu_terrain_upload_ms,gpu_particle_upload_ms,mesh_rebuild_ms,ram_allocated_mb,ram_reserved_mb,mono_heap_mb,gpu_memory_total_mb,terrain_width,terrain_height,terrain_depth,max_particles");
 
             startRealtime = Time.realtimeSinceStartup;
             nextSampleTime = Time.unscaledTime;
@@ -152,6 +153,10 @@ namespace MeteoriteSPH3D
             writer.Write(F(controller.LastGpuTerrainUploadMs)); writer.Write(',');
             writer.Write(F(controller.LastGpuParticleUploadMs)); writer.Write(',');
             writer.Write(F(controller.LastMeshRebuildMs)); writer.Write(',');
+            writer.Write(F(Profiler.GetTotalAllocatedMemoryLong() / (1024f * 1024f))); writer.Write(',');
+            writer.Write(F(Profiler.GetTotalReservedMemoryLong() / (1024f * 1024f))); writer.Write(',');
+            writer.Write(F(Profiler.GetMonoHeapSizeLong() / (1024f * 1024f))); writer.Write(',');
+            writer.Write(SystemInfo.graphicsMemorySize.ToString(invariant)); writer.Write(',');
             writer.Write(controller.terrainWidth.ToString(invariant)); writer.Write(',');
             writer.Write(controller.terrainHeight.ToString(invariant)); writer.Write(',');
             writer.Write(controller.terrainDepth.ToString(invariant)); writer.Write(',');
