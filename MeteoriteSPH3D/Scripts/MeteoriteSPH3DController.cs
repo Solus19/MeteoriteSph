@@ -23,19 +23,19 @@ namespace MeteoriteSPH3D
         [Header("GPU simulation")]
         public bool useGpuSimulation = true;
         public int gpuGridMaxParticlesPerCell = 160;
-        public int gpuReadbackInterval = 4;
+        public int gpuReadbackInterval = 6;
         [Tooltip("Use AsyncGPUReadback for particle state transfer. This avoids blocking the render thread while GPU particles are copied back for deposition.")]
         public bool useAsyncGpuReadback = true;
         [Tooltip("Upload modified voxel terrain back to the GPU only once per N solidification batches. Higher values reduce lag while particles are freezing.")]
-        public int gpuTerrainUploadInterval = 3;
+        public int gpuTerrainUploadInterval = 8;
         [Tooltip("Rebuild the visible voxel mesh only once per N frames while particles are freezing. Higher values reduce lag during deposition.")]
-        public int terrainMeshRebuildInterval = 6;
+        public int terrainMeshRebuildInterval = 2;
         [Tooltip("Voxel chunk side size used by the terrain renderer. 16 is a good default for this prototype.")]
-        public int terrainChunkSize = 16;
+        public int terrainChunkSize = 12;
         [Tooltip("Maximum number of voxel chunks rebuilt in one frame. Lower values reduce spikes; higher values update terrain faster.")]
-        public int maxTerrainChunkRebuildsPerFrame = 4;
+        public int maxTerrainChunkRebuildsPerFrame = 1;
         [Tooltip("MeshCollider for rebuilt chunks is refreshed only once per N frames. Physics particles use the voxel buffer, so visual mesh can update more often than colliders.")]
-        public int terrainColliderUpdateInterval = 12;
+        public int terrainColliderUpdateInterval = 60;
 
         [Header("Impact")]
         public float impactRadius = 8.60f;
@@ -117,7 +117,7 @@ namespace MeteoriteSPH3D
         public float solidifyTemperature = 118f;
         public float solidifySpeed = 0.72f;
         public float solidifyMinAge = 3.0f;
-        public int depositSearchRadiusCells = 5;
+        public int depositSearchRadiusCells = 3;
         public int requiredSolidNeighboursForDeposit = 1;
         public bool depositRequireBelowSupport = true;
         public int minBelowFootprintSupport = 3;
@@ -127,9 +127,9 @@ namespace MeteoriteSPH3D
         public float maxDepositProminenceAboveNeighbours = 0.55f;
         public int minSameLevelNeighboursForProminentDeposit = 1;
         public float antiPillarProminencePenalty = 7.5f;
-        public int maxSolidifyPerFrame = 120;
+        public int maxSolidifyPerFrame = 32;
         [Tooltip("Maximum number of particles checked for solidification in one frame. Prevents full-list scans when many particles exist.")]
-        public int maxSolidifyChecksPerFrame = 9000;
+        public int maxSolidifyChecksPerFrame = 2500;
 
         [Header("Rim capture")]
         public bool rimCaptureEnabled = true;
@@ -470,7 +470,7 @@ namespace MeteoriteSPH3D
             solidifyTemperature = 118f;
             solidifySpeed = 0.72f;
             solidifyMinAge = 3.0f;
-            depositSearchRadiusCells = 5;
+            depositSearchRadiusCells = 3;
             requiredSolidNeighboursForDeposit = 1;
             depositRequireBelowSupport = true;
             minBelowFootprintSupport = 3;
@@ -479,15 +479,15 @@ namespace MeteoriteSPH3D
             maxDepositProminenceAboveNeighbours = 0.55f;
             minSameLevelNeighboursForProminentDeposit = 1;
             antiPillarProminencePenalty = 7.5f;
-            maxSolidifyPerFrame = 120;
-            maxSolidifyChecksPerFrame = 9000;
-            gpuReadbackInterval = 4;
+            maxSolidifyPerFrame = 32;
+            maxSolidifyChecksPerFrame = 2500;
+            gpuReadbackInterval = 6;
             useAsyncGpuReadback = true;
-            gpuTerrainUploadInterval = 3;
-            terrainMeshRebuildInterval = 6;
-            terrainChunkSize = 16;
-            maxTerrainChunkRebuildsPerFrame = 4;
-            terrainColliderUpdateInterval = 12;
+            gpuTerrainUploadInterval = 8;
+            terrainMeshRebuildInterval = 2;
+            terrainChunkSize = 12;
+            maxTerrainChunkRebuildsPerFrame = 1;
+            terrainColliderUpdateInterval = 60;
 
             rimCaptureEnabled = true;
             rimCaptureStartRadiusFactor = 0.42f;
@@ -643,7 +643,7 @@ namespace MeteoriteSPH3D
                     float meshStartMs = Time.realtimeSinceStartup * 1000f;
                     voxelRenderer.Rebuild(terrain);
                     LastMeshRebuildMs += Time.realtimeSinceStartup * 1000f - meshStartMs;
-                    terrainDirty = voxelRenderer.HasPendingRebuilds || (terrain != null && terrain.HasDirtyBounds);
+                    terrainDirty = voxelRenderer.HasPendingRebuilds || (terrain != null && (terrain.HasDirtyBounds || terrain.HasDirtyVoxels));
                     terrainMeshDirtyFrames = terrainDirty ? terrainMeshRebuildInterval : 0;
                 }
             }
@@ -701,11 +701,52 @@ namespace MeteoriteSPH3D
         {
             if (mainCamera == null) return;
             Ray ray = mainCamera.ScreenPointToRay(InputBridge3D.MousePosition());
+
+            Vector3 voxelHit;
+            if (RaycastVoxelTerrain(ray, out voxelHit))
+            {
+                ApplyImpact(voxelHit);
+                return;
+            }
+
             RaycastHit hit;
             if (Physics.Raycast(ray, out hit, 1000f))
             {
                 ApplyImpact(hit.point);
             }
+        }
+
+        private bool RaycastVoxelTerrain(Ray ray, out Vector3 hitPoint)
+        {
+            hitPoint = Vector3.zero;
+            if (terrain == null) return false;
+
+            float maxDistance = Mathf.Max(terrain.WorldWidth, Mathf.Max(terrain.WorldHeight, terrain.WorldDepth)) * 3f;
+            float step = Mathf.Max(terrain.CellSize * 0.45f, 0.05f);
+            float start = Mathf.Max(0f, mainCamera != null ? mainCamera.nearClipPlane : 0f);
+
+            for (float t = start; t <= maxDistance; t += step)
+            {
+                Vector3 p = ray.origin + ray.direction * t;
+                int x = Mathf.FloorToInt(p.x / terrain.CellSize);
+                int z = Mathf.FloorToInt(p.z / terrain.CellSize);
+                if (x < 0 || x >= terrain.Width || z < 0 || z >= terrain.Depth) continue;
+
+                int top = terrain.TopSolidY(x, z);
+                if (top < 0) continue;
+
+                float surfaceY = (top + 1) * terrain.CellSize;
+                if (p.y <= surfaceY)
+                {
+                    hitPoint = new Vector3(
+                        Mathf.Clamp(p.x, 0f, terrain.WorldWidth),
+                        surfaceY,
+                        Mathf.Clamp(p.z, 0f, terrain.WorldDepth));
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private int TopSolidYInColumnForImpact(int x, int z)
@@ -872,6 +913,14 @@ namespace MeteoriteSPH3D
             return v;
         }
 
+        private void RemoveParticleAtSwap(int index)
+        {
+            int last = particles.Count - 1;
+            if (index < 0 || index > last) return;
+            if (index != last) particles[index] = particles[last];
+            particles.RemoveAt(last);
+        }
+
         private int SolidifyParticles()
         {
             int solidified = 0;
@@ -899,7 +948,7 @@ namespace MeteoriteSPH3D
 
                 if (p == null || !p.active)
                 {
-                    particles.RemoveAt(i);
+                    RemoveParticleAtSwap(i);
                     i--;
                     continue;
                 }
@@ -916,7 +965,7 @@ namespace MeteoriteSPH3D
                     {
                         terrain.SetSolid(deposit.x, deposit.y, deposit.z, true, p.temperature, 0f, 0.1f, true);
                         if (UseGpuSimulation && p.gpuIndex >= 0) pendingGpuDeactivateIndices.Add(p.gpuIndex);
-                        particles.RemoveAt(i);
+                        RemoveParticleAtSwap(i);
                         solidified++;
                         terrainDirty = true;
                         gpuTerrainDirty = true;
@@ -954,12 +1003,7 @@ namespace MeteoriteSPH3D
 
         private int TopSolidYInColumn(int x, int z)
         {
-            if (x < 0 || x >= terrainWidth || z < 0 || z >= terrainDepth) return -1;
-            for (int y = terrainHeight - 1; y >= 0; y--)
-            {
-                if (terrain.IsSolid(x, y, z)) return y;
-            }
-            return -1;
+            return terrain != null ? terrain.TopSolidY(x, z) : -1;
         }
 
         private int MaxNeighbourTopY(int x, int z)
@@ -1008,6 +1052,8 @@ namespace MeteoriteSPH3D
         private bool FindDepositCell(Vector3 position, bool rim, bool center, out Vector3Int best)
         {
             best = Vector3Int.zero;
+            if (terrain == null) return false;
+
             Vector3Int c0 = terrain.WorldToCell(position);
             float bestScore = float.PositiveInfinity;
             int radius = Mathf.Max(1, depositSearchRadiusCells);
@@ -1016,100 +1062,98 @@ namespace MeteoriteSPH3D
             {
                 for (int x = c0.x - radius; x <= c0.x + radius; x++)
                 {
-                    float horizontalCellDist = Vector2.Distance(new Vector2(x, z), new Vector2(c0.x, c0.z));
+                    if (x < 0 || x >= terrain.Width || z < 0 || z >= terrain.Depth) continue;
+
+                    float dx = x - c0.x;
+                    float dz = z - c0.z;
+                    float horizontalCellDist = Mathf.Sqrt(dx * dx + dz * dz);
                     if (horizontalCellDist > radius + 0.01f) continue;
 
-                    for (int y = c0.y - radius; y <= c0.y + radius; y++)
+                    int columnTopY = terrain.TopSolidY(x, z);
+                    if (columnTopY < 0 || columnTopY >= terrain.Height - 1) continue;
+
+                    int y = columnTopY + 1;
+                    if (!terrain.InBounds(x, y, z) || terrain.IsSolid(x, y, z)) continue;
+
+                    int belowFootprintSupport = 0;
+                    for (int oz = -1; oz <= 1; oz++)
                     {
-                        if (!terrain.InBounds(x, y, z) || terrain.IsSolid(x, y, z)) continue;
-                        if (!terrain.HasSupport(x, y, z, requiredSolidNeighboursForDeposit)) continue;
-
-                        bool belowSupported = terrain.IsSolid(x, y - 1, z);
-                        if (depositRequireBelowSupport && !belowSupported) continue;
-
-                        int belowFootprintSupport = 0;
-                        for (int oz = -1; oz <= 1; oz++)
+                        for (int ox = -1; ox <= 1; ox++)
                         {
-                            for (int ox = -1; ox <= 1; ox++)
-                            {
-                                if (terrain.IsSolid(x + ox, y - 1, z + oz)) belowFootprintSupport++;
-                            }
+                            if (terrain.IsSolid(x + ox, y - 1, z + oz)) belowFootprintSupport++;
                         }
-                        int requiredFootprint = center ? Mathf.Max(1, minBelowFootprintSupport - 1) : Mathf.Max(1, minBelowFootprintSupport);
-                        if (belowFootprintSupport < requiredFootprint) continue;
+                    }
+                    int requiredFootprint = center ? Mathf.Max(1, minBelowFootprintSupport - 1) : Mathf.Max(1, minBelowFootprintSupport);
+                    if (belowFootprintSupport < requiredFootprint) continue;
 
-                        int columnTopY = TopSolidYInColumn(x, z);
-                        if (antiPillarDepositEnabled && columnTopY >= 0 && y != columnTopY + 1) continue;
+                    int neighbourTopY = MaxNeighbourTopY(x, z);
+                    int allowedRiseAboveNeighbours = rim ? Mathf.Max(maxDepositRiseAboveNeighbours, rimMaxDepositRiseAboveNeighbours) : Mathf.Max(0, maxDepositRiseAboveNeighbours);
+                    if (neighbourTopY >= 0 && y > neighbourTopY + allowedRiseAboveNeighbours) continue;
 
-                        int neighbourTopY = MaxNeighbourTopY(x, z);
-                        int allowedRiseAboveNeighbours = rim ? Mathf.Max(maxDepositRiseAboveNeighbours, rimMaxDepositRiseAboveNeighbours) : Mathf.Max(0, maxDepositRiseAboveNeighbours);
-                        if (neighbourTopY >= 0 && y > neighbourTopY + allowedRiseAboveNeighbours) continue;
+                    float averageNeighbourTopY;
+                    int minNeighbourTopY;
+                    int maxNeighbourTopY;
+                    int neighbourTopCount;
+                    bool hasNeighbourStats = TryNeighbourTopStats(x, z, out averageNeighbourTopY, out minNeighbourTopY, out maxNeighbourTopY, out neighbourTopCount);
+                    float localProminence = hasNeighbourStats ? y - averageNeighbourTopY : 0f;
+                    if (antiPillarDepositEnabled && hasNeighbourStats)
+                    {
+                        float allowedProminence = maxDepositProminenceAboveNeighbours;
+                        if (rim) allowedProminence += rimProminenceAllowanceBonus;
+                        if (center) allowedProminence += 0.15f;
+                        if (localProminence > allowedProminence) continue;
+                    }
 
-                        float averageNeighbourTopY;
-                        int minNeighbourTopY;
-                        int maxNeighbourTopY;
-                        int neighbourTopCount;
-                        bool hasNeighbourStats = TryNeighbourTopStats(x, z, out averageNeighbourTopY, out minNeighbourTopY, out maxNeighbourTopY, out neighbourTopCount);
-                        float localProminence = hasNeighbourStats ? y - averageNeighbourTopY : 0f;
-                        if (antiPillarDepositEnabled && hasNeighbourStats)
+                    int sameLevelCardinalSupport = 0;
+                    if (terrain.IsSolid(x + 1, y, z)) sameLevelCardinalSupport++;
+                    if (terrain.IsSolid(x - 1, y, z)) sameLevelCardinalSupport++;
+                    if (terrain.IsSolid(x, y, z + 1)) sameLevelCardinalSupport++;
+                    if (terrain.IsSolid(x, y, z - 1)) sameLevelCardinalSupport++;
+
+                    if (antiPillarDepositEnabled && hasNeighbourStats && localProminence > 0.25f && sameLevelCardinalSupport < Mathf.Max(0, minSameLevelNeighboursForProminentDeposit))
+                    {
+                        bool supportedRimStart = rim && belowFootprintSupport >= Mathf.Max(1, rimMinBelowFootprintSupport) && localProminence <= rimProminenceAllowanceBonus;
+                        if (!supportedRimStart) continue;
+                    }
+
+                    Vector3 cp = terrain.CellCenter(x, y, z);
+                    float verticalPenalty = Mathf.Abs(cp.y - position.y) * 0.35f;
+                    float upwardPenalty = Mathf.Max(0f, cp.y - position.y) * 1.2f;
+                    float score = horizontalCellDist * 2.8f + verticalPenalty + upwardPenalty;
+
+                    score -= 0.25f;
+                    score -= Mathf.Min(0.75f, (belowFootprintSupport - 1) * 0.10f);
+                    score -= Mathf.Min(0.40f, sameLevelCardinalSupport * 0.10f);
+                    if (antiPillarDepositEnabled && hasNeighbourStats)
+                    {
+                        score += Mathf.Max(0f, localProminence) * antiPillarProminencePenalty;
+                        if (sameLevelCardinalSupport == 0) score += 1.4f;
+                    }
+
+                    if (hasImpact)
+                    {
+                        Vector3 flat = new Vector3(cp.x - lastImpactCenter.x, 0f, cp.z - lastImpactCenter.z);
+                        float craterR = flat.magnitude;
+
+                        if (center)
                         {
-                            float allowedProminence = maxDepositProminenceAboveNeighbours;
-                            if (rim) allowedProminence += rimProminenceAllowanceBonus;
-                            if (center) allowedProminence += 0.15f;
-                            if (localProminence > allowedProminence) continue;
+                            score += craterR * centerDepositBias;
+                            score += Mathf.Max(0f, cp.y - lastImpactCenter.y) * 0.7f;
                         }
-
-                        int sameLevelCardinalSupport = 0;
-                        if (terrain.IsSolid(x + 1, y, z)) sameLevelCardinalSupport++;
-                        if (terrain.IsSolid(x - 1, y, z)) sameLevelCardinalSupport++;
-                        if (terrain.IsSolid(x, y, z + 1)) sameLevelCardinalSupport++;
-                        if (terrain.IsSolid(x, y, z - 1)) sameLevelCardinalSupport++;
-
-                        if (antiPillarDepositEnabled && hasNeighbourStats && localProminence > 0.25f && sameLevelCardinalSupport < Mathf.Max(0, minSameLevelNeighboursForProminentDeposit))
+                        else if (rim)
                         {
-                            bool supportedRimStart = rim && belowFootprintSupport >= Mathf.Max(1, rimMinBelowFootprintSupport) && localProminence <= rimProminenceAllowanceBonus;
-                            if (!supportedRimStart) continue;
+                            float targetR = Mathf.Max(cellSize, lastImpactRadius * rimDepositTargetRadiusFactor);
+                            score += Mathf.Abs(craterR - targetR) * rimDepositTargetBias;
+                            score -= craterR * outwardDepositBias;
+                            score -= Mathf.Max(0f, cp.y - lastImpactCenter.y) * 0.55f;
+                            if (cp.y < lastImpactCenter.y) score += 3.5f;
                         }
+                    }
 
-                        Vector3 cp = terrain.CellCenter(x, y, z);
-                        float verticalPenalty = Mathf.Abs(cp.y - position.y) * 0.35f;
-                        float upwardPenalty = Mathf.Max(0f, cp.y - position.y) * 1.2f;
-                        float score = horizontalCellDist * 2.8f + verticalPenalty + upwardPenalty;
-
-                        if (belowSupported) score -= 0.25f;
-                        score -= Mathf.Min(0.75f, (belowFootprintSupport - 1) * 0.10f);
-                        score -= Mathf.Min(0.40f, sameLevelCardinalSupport * 0.10f);
-                        if (antiPillarDepositEnabled && hasNeighbourStats)
-                        {
-                            score += Mathf.Max(0f, localProminence) * antiPillarProminencePenalty;
-                            if (sameLevelCardinalSupport == 0) score += 1.4f;
-                        }
-
-                        if (hasImpact)
-                        {
-                            Vector3 flat = new Vector3(cp.x - lastImpactCenter.x, 0f, cp.z - lastImpactCenter.z);
-                            float craterR = flat.magnitude;
-
-                            if (center)
-                            {
-                                score += craterR * centerDepositBias;
-                                score += Mathf.Max(0f, cp.y - lastImpactCenter.y) * 0.7f;
-                            }
-                            else if (rim)
-                            {
-                                float targetR = Mathf.Max(cellSize, lastImpactRadius * rimDepositTargetRadiusFactor);
-                                score += Mathf.Abs(craterR - targetR) * rimDepositTargetBias;
-                                score -= craterR * outwardDepositBias;
-                                score -= Mathf.Max(0f, cp.y - lastImpactCenter.y) * 0.55f;
-                                if (cp.y < lastImpactCenter.y) score += 3.5f;
-                            }
-                        }
-
-                        if (score < bestScore)
-                        {
-                            bestScore = score;
-                            best = new Vector3Int(x, y, z);
-                        }
+                    if (score < bestScore)
+                    {
+                        bestScore = score;
+                        best = new Vector3Int(x, y, z);
                     }
                 }
             }

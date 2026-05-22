@@ -8,9 +8,13 @@ namespace MeteoriteSPH3D
     public sealed class VoxelMeshRenderer3D : MonoBehaviour
     {
         [Header("Chunked voxel mesh")]
-        public int chunkSize = 16;
-        public int maxChunkRebuildsPerCall = 4;
-        public int colliderUpdateIntervalFrames = 12;
+        public int chunkSize = 12;
+        public int maxChunkRebuildsPerCall = 1;
+        public int colliderUpdateIntervalFrames = 60;
+        [Tooltip("Chunk MeshColliders are disabled by default. Mouse picking uses a custom voxel raycast, so collider cooking no longer stalls deposition.")]
+        public bool enableChunkColliders = false;
+        [Tooltip("Build only the visible heightfield surface instead of scanning every solid voxel. Much faster for this terrain-style crater prototype.")]
+        public bool useHeightfieldMeshing = true;
 
         public bool HasPendingRebuilds { get { return dirtyChunkQueue.Count > 0; } }
         public int LastRebuiltChunks { get; private set; }
@@ -35,6 +39,7 @@ namespace MeteoriteSPH3D
         private Chunk[] chunks;
         private bool[] queuedChunks;
         private readonly Queue<int> dirtyChunkQueue = new Queue<int>(512);
+        private readonly List<int> dirtyVoxelScratch = new List<int>(4096);
 
         private int chunkGridX;
         private int chunkGridY;
@@ -128,20 +133,36 @@ namespace MeteoriteSPH3D
             if (material == null) Initialize();
             EnsureChunks(terrain);
 
-            bool hadDirtyBounds = false;
-            int minX;
-            int minY;
-            int minZ;
-            int maxX;
-            int maxY;
-            int maxZ;
-            if (terrain.ConsumeDirtyBounds(out minX, out minY, out minZ, out maxX, out maxY, out maxZ))
+            bool hadDirty = false;
+            if (terrain.ConsumeDirtyVoxelIndices(dirtyVoxelScratch))
             {
-                hadDirtyBounds = true;
-                EnqueueChunksForBounds(minX - 1, minY - 1, minZ - 1, maxX + 1, maxY + 1, maxZ + 1);
+                hadDirty = true;
+                for (int i = 0; i < dirtyVoxelScratch.Count; i++)
+                {
+                    int x;
+                    int y;
+                    int z;
+                    terrain.UnpackIndex(dirtyVoxelScratch[i], out x, out y, out z);
+                    EnqueueChunksForBounds(x - 1, y - 1, z - 1, x + 1, y + 1, z + 1);
+                }
+                dirtyVoxelScratch.Clear();
+            }
+            else
+            {
+                int minX;
+                int minY;
+                int minZ;
+                int maxX;
+                int maxY;
+                int maxZ;
+                if (terrain.ConsumeDirtyBounds(out minX, out minY, out minZ, out maxX, out maxY, out maxZ))
+                {
+                    hadDirty = true;
+                    EnqueueChunksForBounds(minX - 1, minY - 1, minZ - 1, maxX + 1, maxY + 1, maxZ + 1);
+                }
             }
 
-            if (!builtAtLeastOnce || (dirtyChunkQueue.Count == 0 && !hadDirtyBounds))
+            if (!builtAtLeastOnce || (dirtyChunkQueue.Count == 0 && !hadDirty))
             {
                 EnqueueAllChunks();
             }
@@ -191,6 +212,7 @@ namespace MeteoriteSPH3D
                         MeshFilter mf = go.AddComponent<MeshFilter>();
                         MeshRenderer mr = go.AddComponent<MeshRenderer>();
                         MeshCollider mc = go.AddComponent<MeshCollider>();
+                        mc.enabled = enableChunkColliders;
                         Mesh m = new Mesh();
                         m.indexFormat = IndexFormat.UInt32;
                         m.name = go.name + " Mesh";
@@ -299,6 +321,70 @@ namespace MeteoriteSPH3D
             LastRebuiltChunks = rebuilt;
         }
 
+        private void AddFace(Vector3 basePos, float s, int faceIndex, Color col)
+        {
+            int start = vertices.Count;
+            Vector3Int d = dirs[faceIndex];
+            Vector3 normal = new Vector3(d.x, d.y, d.z);
+            for (int k = 0; k < 4; k++)
+            {
+                vertices.Add(basePos + face[faceIndex, k] * s);
+                normals.Add(normal);
+                colors.Add(col);
+                uvs.Add(faceUvs[k]);
+            }
+
+            triangles.Add(start + 0);
+            triangles.Add(start + 1);
+            triangles.Add(start + 2);
+            triangles.Add(start + 0);
+            triangles.Add(start + 2);
+            triangles.Add(start + 3);
+        }
+
+        private bool TryBuildHeightfieldChunk(VoxelTerrain3D terrain, int x0, int y0, int z0, int x1, int y1, int z1, float s, MeteoriteSPH3DController controller)
+        {
+            if (!useHeightfieldMeshing) return false;
+            if (controller != null && controller.layerViewEnabled) return false;
+
+            for (int z = z0; z < z1; z++)
+            {
+                for (int x = x0; x < x1; x++)
+                {
+                    int top = terrain.TopSolidY(x, z);
+                    if (top < 0) continue;
+
+                    if (top >= y0 && top < y1)
+                    {
+                        VoxelCell3D topCell = terrain.Get(x, top, z);
+                        AddFace(new Vector3(x * s, top * s, z * s), s, 2, ColorForCell(topCell));
+                    }
+
+                    AddHeightfieldSide(terrain, x, z, x + 1, z, top, y0, y1, s, 0);
+                    AddHeightfieldSide(terrain, x, z, x - 1, z, top, y0, y1, s, 1);
+                    AddHeightfieldSide(terrain, x, z, x, z + 1, top, y0, y1, s, 4);
+                    AddHeightfieldSide(terrain, x, z, x, z - 1, top, y0, y1, s, 5);
+                }
+            }
+
+            return true;
+        }
+
+        private void AddHeightfieldSide(VoxelTerrain3D terrain, int x, int z, int nx, int nz, int top, int y0, int y1, float s, int faceIndex)
+        {
+            int neighbourTop = terrain.TopSolidY(nx, nz);
+            if (neighbourTop >= top) return;
+
+            int fromY = Mathf.Max(neighbourTop + 1, y0);
+            int toY = Mathf.Min(top, y1 - 1);
+            for (int y = fromY; y <= toY; y++)
+            {
+                if (!terrain.InBounds(x, y, z)) continue;
+                VoxelCell3D cell = terrain.Get(x, y, z);
+                AddFace(new Vector3(x * s, y * s, z * s), s, faceIndex, ColorForCell(cell));
+            }
+        }
+
         private void BuildChunk(VoxelTerrain3D terrain, Chunk chunk, bool forceCollider)
         {
             vertices.Clear();
@@ -316,42 +402,30 @@ namespace MeteoriteSPH3D
             float s = terrain.CellSize;
             MeteoriteSPH3DController controller = MeteoriteSPH3DController.Instance;
 
-            for (int y = y0; y < y1; y++)
+            if (!TryBuildHeightfieldChunk(terrain, x0, y0, z0, x1, y1, z1, s, controller))
             {
-                for (int z = z0; z < z1; z++)
+                for (int y = y0; y < y1; y++)
                 {
-                    for (int x = x0; x < x1; x++)
+                    for (int z = z0; z < z1; z++)
                     {
-                        if (!terrain.IsSolid(x, y, z)) continue;
-                        if (controller != null && !controller.IsVoxelVisible(x, y, z)) continue;
-
-                        VoxelCell3D cell = terrain.Get(x, y, z);
-                        Color col = ColorForCell(cell);
-                        Vector3 basePos = new Vector3(x * s, y * s, z * s);
-
-                        for (int f = 0; f < 6; f++)
+                        for (int x = x0; x < x1; x++)
                         {
-                            Vector3Int d = dirs[f];
-                            bool neighbourSolid = terrain.IsSolid(x + d.x, y + d.y, z + d.z);
-                            bool neighbourVisible = controller == null || controller.IsVoxelVisible(x + d.x, y + d.y, z + d.z);
-                            if (neighbourSolid && neighbourVisible) continue;
+                            if (!terrain.IsSolid(x, y, z)) continue;
+                            if (controller != null && !controller.IsVoxelVisible(x, y, z)) continue;
 
-                            int start = vertices.Count;
-                            Vector3 normal = new Vector3(d.x, d.y, d.z);
-                            for (int k = 0; k < 4; k++)
+                            VoxelCell3D cell = terrain.Get(x, y, z);
+                            Color col = ColorForCell(cell);
+                            Vector3 basePos = new Vector3(x * s, y * s, z * s);
+
+                            for (int f = 0; f < 6; f++)
                             {
-                                vertices.Add(basePos + face[f, k] * s);
-                                normals.Add(normal);
-                                colors.Add(col);
-                                uvs.Add(faceUvs[k]);
-                            }
+                                Vector3Int d = dirs[f];
+                                bool neighbourSolid = terrain.IsSolid(x + d.x, y + d.y, z + d.z);
+                                bool neighbourVisible = controller == null || controller.IsVoxelVisible(x + d.x, y + d.y, z + d.z);
+                                if (neighbourSolid && neighbourVisible) continue;
 
-                            triangles.Add(start + 0);
-                            triangles.Add(start + 1);
-                            triangles.Add(start + 2);
-                            triangles.Add(start + 0);
-                            triangles.Add(start + 2);
-                            triangles.Add(start + 3);
+                                AddFace(basePos, s, f, col);
+                            }
                         }
                     }
                 }
@@ -369,14 +443,23 @@ namespace MeteoriteSPH3D
                 mesh.RecalculateBounds();
             }
 
-            bool updateCollider = forceCollider
-                                  || colliderUpdateIntervalFrames <= 1
-                                  || Time.frameCount % Mathf.Max(1, colliderUpdateIntervalFrames) == 0
-                                  || fullRebuildSerial <= 1;
-            if (updateCollider)
+            if (enableChunkColliders && chunk.collider != null)
             {
+                bool updateCollider = forceCollider
+                                      || colliderUpdateIntervalFrames <= 1
+                                      || Time.frameCount % Mathf.Max(1, colliderUpdateIntervalFrames) == 0
+                                      || fullRebuildSerial <= 1;
+                if (updateCollider)
+                {
+                    chunk.collider.enabled = true;
+                    chunk.collider.sharedMesh = null;
+                    chunk.collider.sharedMesh = vertices.Count > 0 ? mesh : null;
+                }
+            }
+            else if (chunk.collider != null && chunk.collider.enabled)
+            {
+                chunk.collider.enabled = false;
                 chunk.collider.sharedMesh = null;
-                chunk.collider.sharedMesh = vertices.Count > 0 ? mesh : null;
             }
         }
 

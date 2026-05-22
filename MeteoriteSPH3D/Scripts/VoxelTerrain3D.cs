@@ -17,9 +17,13 @@ namespace MeteoriteSPH3D
 
         public int SolidCount { get; private set; }
         public bool HasDirtyBounds { get { return dirtyBoundsValid; } }
+        public bool HasDirtyVoxels { get { return dirtyVoxelIndices.Count > 0; } }
 
         private readonly List<int> thermalIndices = new List<int>(4096);
         private readonly bool[] thermalQueued;
+        private readonly int[] topSolidYByColumn;
+        private readonly List<int> dirtyVoxelIndices = new List<int>(4096);
+        private readonly bool[] dirtyVoxelQueued;
 
         private bool dirtyBoundsValid;
         private int dirtyMinX;
@@ -37,11 +41,64 @@ namespace MeteoriteSPH3D
             CellSize = Mathf.Max(0.05f, cellSize);
             Cells = new VoxelCell3D[Width * Height * Depth];
             thermalQueued = new bool[Cells.Length];
+            topSolidYByColumn = new int[Width * Depth];
+            dirtyVoxelQueued = new bool[Cells.Length];
+            for (int i = 0; i < topSolidYByColumn.Length; i++) topSolidYByColumn[i] = -1;
         }
 
         public int Index(int x, int y, int z)
         {
             return x + Width * (z + Depth * y);
+        }
+
+        public int ColumnIndex(int x, int z)
+        {
+            return x + Width * z;
+        }
+
+        public void UnpackIndex(int index, out int x, out int y, out int z)
+        {
+            y = index / (Width * Depth);
+            int rem = index - y * Width * Depth;
+            z = rem / Width;
+            x = rem - z * Width;
+        }
+
+        public int TopSolidY(int x, int z)
+        {
+            if (x < 0 || x >= Width || z < 0 || z >= Depth) return -1;
+            return topSolidYByColumn[ColumnIndex(x, z)];
+        }
+
+        public float SurfaceHeightWorld(int x, int z)
+        {
+            int top = TopSolidY(x, z);
+            return top >= 0 ? (top + 1) * CellSize : 0f;
+        }
+
+        private void UpdateTopSolidCacheAfterSet(int x, int y, int z, bool wasSolid, bool isSolid)
+        {
+            int ci = ColumnIndex(x, z);
+            int oldTop = topSolidYByColumn[ci];
+            if (isSolid)
+            {
+                if (y > oldTop) topSolidYByColumn[ci] = y;
+                return;
+            }
+
+            if (wasSolid && y == oldTop)
+            {
+                int newTop = -1;
+                for (int yy = y - 1; yy >= 0; yy--)
+                {
+                    if (Cells[Index(x, yy, z)].solid)
+                    {
+                        newTop = yy;
+                        break;
+                    }
+                }
+                topSolidYByColumn[ci] = newTop;
+            }
         }
 
         public bool InBounds(int x, int y, int z)
@@ -68,6 +125,7 @@ namespace MeteoriteSPH3D
             Cells[i] = cell;
             if (!wasSolid && cell.solid) SolidCount++;
             if (wasSolid && !cell.solid) SolidCount--;
+            UpdateTopSolidCacheAfterSet(x, y, z, wasSolid, cell.solid);
             MarkDirtyVoxel(x, y, z);
             QueueThermalIfNeeded(i, cell);
         }
@@ -85,6 +143,7 @@ namespace MeteoriteSPH3D
 
             if (!wasSolid && solid) SolidCount++;
             if (wasSolid && !solid) SolidCount--;
+            UpdateTopSolidCacheAfterSet(x, y, z, wasSolid, solid);
             MarkDirtyVoxel(x, y, z);
             QueueThermalIfNeeded(i, Cells[i]);
         }
@@ -93,6 +152,7 @@ namespace MeteoriteSPH3D
         {
             ClearThermalState();
             SolidCount = 0;
+            for (int i = 0; i < topSolidYByColumn.Length; i++) topSolidYByColumn[i] = -1;
             baseHeight = Mathf.Clamp(baseHeight, 1, Height - 2);
 
             for (int y = 0; y < Height; y++)
@@ -110,7 +170,12 @@ namespace MeteoriteSPH3D
                             damage = 0f,
                             deposited = false
                         };
-                        if (solid) SolidCount++;
+                        if (solid)
+                        {
+                            SolidCount++;
+                            int ci = ColumnIndex(x, z);
+                            if (y > topSolidYByColumn[ci]) topSolidYByColumn[ci] = y;
+                        }
                     }
                 }
             }
@@ -122,6 +187,7 @@ namespace MeteoriteSPH3D
         {
             ClearThermalState();
             SolidCount = 0;
+            for (int i = 0; i < topSolidYByColumn.Length; i++) topSolidYByColumn[i] = -1;
             baseHeight = Mathf.Clamp(baseHeight, 1, Height - 2);
             amplitudeCells = Mathf.Clamp(amplitudeCells, 0, Mathf.Max(0, Height / 2));
             noiseScale = Mathf.Max(0.001f, noiseScale);
@@ -207,7 +273,12 @@ namespace MeteoriteSPH3D
                             damage = 0f,
                             deposited = false
                         };
-                        if (solid) SolidCount++;
+                        if (solid)
+                        {
+                            SolidCount++;
+                            int ci = ColumnIndex(x, z);
+                            if (y > topSolidYByColumn[ci]) topSolidYByColumn[ci] = y;
+                        }
                     }
                 }
             }
@@ -256,19 +327,28 @@ namespace MeteoriteSPH3D
                 dirtyMinX = dirtyMaxX = x;
                 dirtyMinY = dirtyMaxY = y;
                 dirtyMinZ = dirtyMaxZ = z;
-                return;
+            }
+            else
+            {
+                if (x < dirtyMinX) dirtyMinX = x;
+                if (y < dirtyMinY) dirtyMinY = y;
+                if (z < dirtyMinZ) dirtyMinZ = z;
+                if (x > dirtyMaxX) dirtyMaxX = x;
+                if (y > dirtyMaxY) dirtyMaxY = y;
+                if (z > dirtyMaxZ) dirtyMaxZ = z;
             }
 
-            if (x < dirtyMinX) dirtyMinX = x;
-            if (y < dirtyMinY) dirtyMinY = y;
-            if (z < dirtyMinZ) dirtyMinZ = z;
-            if (x > dirtyMaxX) dirtyMaxX = x;
-            if (y > dirtyMaxY) dirtyMaxY = y;
-            if (z > dirtyMaxZ) dirtyMaxZ = z;
+            int index = Index(x, y, z);
+            if (!dirtyVoxelQueued[index])
+            {
+                dirtyVoxelQueued[index] = true;
+                dirtyVoxelIndices.Add(index);
+            }
         }
 
         public void MarkAllDirty()
         {
+            ClearDirtyVoxelQueue();
             dirtyBoundsValid = true;
             dirtyMinX = 0;
             dirtyMinY = 0;
@@ -276,6 +356,32 @@ namespace MeteoriteSPH3D
             dirtyMaxX = Width - 1;
             dirtyMaxY = Height - 1;
             dirtyMaxZ = Depth - 1;
+        }
+
+        public bool ConsumeDirtyVoxelIndices(List<int> target)
+        {
+            if (target == null) return false;
+            target.Clear();
+            if (dirtyVoxelIndices.Count == 0) return false;
+
+            for (int i = 0; i < dirtyVoxelIndices.Count; i++)
+            {
+                int index = dirtyVoxelIndices[i];
+                target.Add(index);
+                dirtyVoxelQueued[index] = false;
+            }
+            dirtyVoxelIndices.Clear();
+            dirtyBoundsValid = false;
+            return target.Count > 0;
+        }
+
+        private void ClearDirtyVoxelQueue()
+        {
+            for (int i = 0; i < dirtyVoxelIndices.Count; i++)
+            {
+                dirtyVoxelQueued[dirtyVoxelIndices[i]] = false;
+            }
+            dirtyVoxelIndices.Clear();
         }
 
         public bool ConsumeDirtyBounds(out int minX, out int minY, out int minZ, out int maxX, out int maxY, out int maxZ)
@@ -339,6 +445,7 @@ namespace MeteoriteSPH3D
             thermalIndices.Clear();
             System.Array.Clear(thermalQueued, 0, thermalQueued.Length);
             dirtyBoundsValid = false;
+            ClearDirtyVoxelQueue();
         }
     }
 }
