@@ -16,6 +16,15 @@ namespace MeteoriteSPH3D
         [Tooltip("Build only the visible heightfield surface instead of scanning every solid voxel. Much faster for this terrain-style crater prototype.")]
         public bool useHeightfieldMeshing = true;
 
+        [Header("Shadows")]
+        [Tooltip("Optional fallback: adds fake directional darkening into vertex colors. Disabled by default because the realtime shadow map now works on the voxel mesh.")]
+        public bool useBakedDirectionalShadows = false;
+        [Range(0.0f, 1.0f)] public float bakedAmbient = 0.34f;
+        [Range(0.0f, 1.5f)] public float bakedDiffuse = 0.78f;
+        [Range(0.0f, 1.0f)] public float bakedShadowStrength = 0.58f;
+        [Range(4, 80)] public int bakedShadowSteps = 38;
+        [Range(0.0f, 2.0f)] public float bakedShadowBiasCells = 0.30f;
+
         public bool HasPendingRebuilds { get { return dirtyChunkQueue.Count > 0; } }
         public int LastRebuiltChunks { get; private set; }
         public int PendingChunkRebuilds { get { return dirtyChunkQueue.Count; } }
@@ -89,13 +98,22 @@ namespace MeteoriteSPH3D
             rootMeshCollider = GetComponent<MeshCollider>();
 
             Shader shader = Shader.Find("MeteoriteSPH3D/VertexColorUnlit");
-            if (shader == null) shader = Shader.Find("Sprites/Default");
+            if (shader == null || !shader.isSupported) shader = Shader.Find("Universal Render Pipeline/Lit");
+            if (shader == null || !shader.isSupported) shader = Shader.Find("Universal Render Pipeline/Simple Lit");
+            if (shader == null || !shader.isSupported) shader = Shader.Find("Standard");
+            if (shader == null || !shader.isSupported) shader = Shader.Find("Sprites/Default");
+            if (shader == null || !shader.isSupported) shader = Shader.Find("Unlit/Color");
             material = new Material(shader);
+            if (material.HasProperty("_EdgeShade")) material.SetFloat("_EdgeShade", 0.035f);
+            if (material.HasProperty("_BaseColor")) material.SetColor("_BaseColor", Color.gray);
+            if (material.HasProperty("_Color")) material.SetColor("_Color", Color.gray);
 
             Mesh empty = new Mesh();
             empty.name = "Meteorite SPH 3D Voxel Root Empty";
             rootMeshFilter.sharedMesh = empty;
             rootMeshRenderer.sharedMaterial = material;
+            rootMeshRenderer.shadowCastingMode = ShadowCastingMode.Off;
+            rootMeshRenderer.receiveShadows = false;
             rootMeshRenderer.enabled = false;
             rootMeshCollider.sharedMesh = null;
             rootMeshCollider.enabled = false;
@@ -220,6 +238,12 @@ namespace MeteoriteSPH3D
 
                         mf.sharedMesh = m;
                         mr.sharedMaterial = material;
+                        // Realtime shadows are enabled on the visible voxel chunks.
+                        // Particles still render without shadows, so only the terrain/rim casts.
+                        mr.shadowCastingMode = ShadowCastingMode.On;
+                        mr.receiveShadows = true;
+                        mr.lightProbeUsage = LightProbeUsage.Off;
+                        mr.reflectionProbeUsage = ReflectionProbeUsage.Off;
                         mc.sharedMesh = null;
 
                         chunks[id] = new Chunk
@@ -321,16 +345,17 @@ namespace MeteoriteSPH3D
             LastRebuiltChunks = rebuilt;
         }
 
-        private void AddFace(Vector3 basePos, float s, int faceIndex, Color col)
+        private void AddFace(VoxelTerrain3D terrain, int x, int y, int z, Vector3 basePos, float s, int faceIndex, Color col)
         {
             int start = vertices.Count;
             Vector3Int d = dirs[faceIndex];
             Vector3 normal = new Vector3(d.x, d.y, d.z);
+            Color litColor = ApplyBakedDirectionalShadow(terrain, x, y, z, faceIndex, col);
             for (int k = 0; k < 4; k++)
             {
                 vertices.Add(basePos + face[faceIndex, k] * s);
                 normals.Add(normal);
-                colors.Add(col);
+                colors.Add(litColor);
                 uvs.Add(faceUvs[k]);
             }
 
@@ -357,7 +382,7 @@ namespace MeteoriteSPH3D
                     if (top >= y0 && top < y1)
                     {
                         VoxelCell3D topCell = terrain.Get(x, top, z);
-                        AddFace(new Vector3(x * s, top * s, z * s), s, 2, ColorForCell(topCell));
+                        AddFace(terrain, x, top, z, new Vector3(x * s, top * s, z * s), s, 2, ColorForCell(topCell));
                     }
 
                     AddHeightfieldSide(terrain, x, z, x + 1, z, top, y0, y1, s, 0);
@@ -381,7 +406,7 @@ namespace MeteoriteSPH3D
             {
                 if (!terrain.InBounds(x, y, z)) continue;
                 VoxelCell3D cell = terrain.Get(x, y, z);
-                AddFace(new Vector3(x * s, y * s, z * s), s, faceIndex, ColorForCell(cell));
+                AddFace(terrain, x, y, z, new Vector3(x * s, y * s, z * s), s, faceIndex, ColorForCell(cell));
             }
         }
 
@@ -424,7 +449,7 @@ namespace MeteoriteSPH3D
                                 bool neighbourVisible = controller == null || controller.IsVoxelVisible(x + d.x, y + d.y, z + d.z);
                                 if (neighbourSolid && neighbourVisible) continue;
 
-                                AddFace(basePos, s, f, col);
+                                AddFace(terrain, x, y, z, basePos, s, f, col);
                             }
                         }
                     }
@@ -461,6 +486,92 @@ namespace MeteoriteSPH3D
                 chunk.collider.enabled = false;
                 chunk.collider.sharedMesh = null;
             }
+        }
+
+        private Color ApplyBakedDirectionalShadow(VoxelTerrain3D terrain, int x, int y, int z, int faceIndex, Color baseColor)
+        {
+            if (!useBakedDirectionalShadows || terrain == null) return baseColor;
+
+            Vector3Int d = dirs[faceIndex];
+            Vector3 normal = new Vector3(d.x, d.y, d.z);
+            Vector3 lightDir = GetDirectionalLightVector();
+
+            float ndl = Mathf.Clamp01(Vector3.Dot(normal, lightDir));
+            float lighting = Mathf.Clamp(bakedAmbient + ndl * bakedDiffuse, 0.18f, 1.22f);
+
+            // Vertical voxel walls are the easiest place to notice shape. Keep them clearly shaded.
+            if (faceIndex != 2)
+            {
+                lighting *= Mathf.Lerp(0.62f, 1.0f, ndl);
+            }
+
+            // Real-time shadow maps are unreliable for this custom vertex-color terrain in some pipelines.
+            // This inexpensive heightfield test gives stable crater/rim shadows in both Built-in and URP projects.
+            if (faceIndex == 2 && IsHeightfieldShadowed(terrain, x, y, z, lightDir))
+            {
+                lighting *= Mathf.Clamp01(1.0f - bakedShadowStrength);
+            }
+
+            Color result = baseColor * lighting;
+            result.a = baseColor.a;
+            return result;
+        }
+
+        private static Vector3 GetDirectionalLightVector()
+        {
+            Light sun = RenderSettings.sun;
+            if (sun != null && sun.type == LightType.Directional)
+            {
+                // Direction from the surface point toward the light source.
+                return (-sun.transform.forward).normalized;
+            }
+
+            // Fallback matches the default Voxel Key Light direction closely enough.
+            return new Vector3(-0.48f, 0.72f, -0.50f).normalized;
+        }
+
+        private bool IsHeightfieldShadowed(VoxelTerrain3D terrain, int x, int y, int z, Vector3 lightDir)
+        {
+            if (lightDir.y <= 0.02f) return false;
+
+            Vector2 horizontal = new Vector2(lightDir.x, lightDir.z);
+            float horizontalLength = horizontal.magnitude;
+            if (horizontalLength < 0.001f) return false;
+
+            Vector2 stepDir = horizontal / horizontalLength;
+            float verticalPerCell = lightDir.y / horizontalLength;
+            float rayY = y + 1.0f + bakedShadowBiasCells;
+            float px = x + 0.5f;
+            float pz = z + 0.5f;
+            int previousX = x;
+            int previousZ = z;
+
+            int maxSteps = Mathf.Clamp(bakedShadowSteps, 4, 80);
+            for (int step = 1; step <= maxSteps; step++)
+            {
+                px += stepDir.x;
+                pz += stepDir.y;
+                rayY += verticalPerCell;
+
+                int sx = Mathf.FloorToInt(px);
+                int sz = Mathf.FloorToInt(pz);
+                if (sx == previousX && sz == previousZ) continue;
+                previousX = sx;
+                previousZ = sz;
+
+                if (sx < 0 || sx >= terrain.Width || sz < 0 || sz >= terrain.Depth) break;
+
+                int top = terrain.TopSolidY(sx, sz);
+                if (top < 0) continue;
+
+                // top + 1 is the world-facing top surface of that voxel column in cell units.
+                if (top + 1.0f > rayY)
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private Color ColorForCell(VoxelCell3D c)

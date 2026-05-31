@@ -81,11 +81,20 @@ namespace MeteoriteSPH3D
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
         private static void AutoInstall()
         {
-            if (FindObjectOfType<GifRecorder3D>() != null) return;
+            if (FindExistingRecorder() != null) return;
 
             GameObject go = new GameObject("GIF Recorder 3D");
             DontDestroyOnLoad(go);
             go.AddComponent<GifRecorder3D>();
+        }
+
+        private static GifRecorder3D FindExistingRecorder()
+        {
+#if UNITY_2023_1_OR_NEWER
+            return UnityEngine.Object.FindFirstObjectByType<GifRecorder3D>();
+#else
+            return UnityEngine.Object.FindObjectOfType<GifRecorder3D>();
+#endif
         }
 
         private void Update()

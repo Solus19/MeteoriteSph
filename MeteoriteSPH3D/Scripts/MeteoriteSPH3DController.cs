@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Reflection;
 using UnityEngine;
 
 namespace MeteoriteSPH3D
@@ -227,6 +228,9 @@ namespace MeteoriteSPH3D
             mainCamera.backgroundColor = new Color(0.68f, 0.76f, 0.86f, 1f);
             mainCamera.nearClipPlane = 0.03f;
             mainCamera.farClipPlane = 400f;
+            // Do not force legacy camera depth textures here. URP shadow maps are used by the voxel shader,
+            // and the shader deliberately avoids screen-space shadows to prevent depth-buffer CommandBuffer warnings.
+            mainCamera.depthTextureMode = DepthTextureMode.None;
             camGo.tag = "MainCamera";
             cameraController = camGo.AddComponent<CameraController3D>();
             float cameraDistance = Mathf.Max(terrain.WorldWidth, terrain.WorldDepth) * 1.25f;
@@ -254,24 +258,101 @@ namespace MeteoriteSPH3D
         private void SetupLighting()
         {
             RenderSettings.ambientMode = UnityEngine.Rendering.AmbientMode.Flat;
-            RenderSettings.ambientLight = new Color(0.40f, 0.43f, 0.48f, 1f);
+            RenderSettings.ambientLight = new Color(0.08f, 0.085f, 0.095f, 1f);
+            RenderSettings.subtractiveShadowColor = new Color(0.05f, 0.055f, 0.065f, 1f);
 
-            GameObject lightGo = new GameObject("Voxel Key Light");
-            Light key = lightGo.AddComponent<Light>();
-            key.type = LightType.Directional;
-            key.color = new Color(1f, 0.97f, 0.92f, 1f);
-            key.intensity = 1.55f;
-            key.shadows = LightShadows.None;
-            key.shadowStrength = 0f;
-            lightGo.transform.rotation = Quaternion.Euler(54f, -48f, 0f);
+            // Real shadow maps are enabled here. The voxel chunks below have
+            // Cast Shadows and Receive Shadows enabled, and the vertex-color shader
+            // now has proper Built-in + URP shadow passes.
+            QualitySettings.shadows = ShadowQuality.All;
+            QualitySettings.shadowDistance = 220f;
+            QualitySettings.shadowResolution = ShadowResolution.High;
+            QualitySettings.shadowCascades = 2;
+            QualitySettings.shadowProjection = ShadowProjection.StableFit;
+            TryConfigureUrpShadows();
 
-            GameObject fillGo = new GameObject("Voxel Fill Light");
-            Light fill = fillGo.AddComponent<Light>();
-            fill.type = LightType.Directional;
-            fill.color = new Color(0.72f, 0.82f, 1.0f, 1f);
-            fill.intensity = 0.28f;
+            Light key = GetOrCreateDirectionalLight("Voxel Key Light");
+            key.color = new Color(1f, 0.96f, 0.88f, 1f);
+            key.intensity = 1.12f;
+            key.shadows = LightShadows.Soft;
+            key.shadowStrength = 0.96f;
+            key.shadowBias = 0.006f;
+            key.shadowNormalBias = 0.035f;
+            key.shadowNearPlane = 0.1f;
+            key.renderMode = LightRenderMode.ForcePixel;
+            // Low side light: shadows from crater rim and voxel columns are much more visible.
+            key.transform.rotation = Quaternion.Euler(24f, -48f, 0f);
+            RenderSettings.sun = key;
+
+            Light fill = GetOrCreateDirectionalLight("Voxel Fill Light");
+            fill.color = new Color(0.70f, 0.82f, 1.0f, 1f);
+            fill.intensity = 0.0f;
             fill.shadows = LightShadows.None;
-            fillGo.transform.rotation = Quaternion.Euler(18f, 132f, 0f);
+            fill.transform.rotation = Quaternion.Euler(18f, 132f, 0f);
+        }
+
+        private static void TryConfigureUrpShadows()
+        {
+            // If the host project uses URP, its asset can silently disable main-light shadows.
+            // Use reflection so this folder still compiles in Built-in projects without a URP assembly reference.
+            object asset = UnityEngine.Rendering.GraphicsSettings.currentRenderPipeline;
+            if (asset == null) return;
+
+            System.Type type = asset.GetType();
+            if (type == null || type.FullName == null || !type.FullName.Contains("UniversalRenderPipelineAsset")) return;
+
+            SetFieldOrProperty(asset, type, "m_MainLightShadowsSupported", true);
+            SetFieldOrProperty(asset, type, "supportsMainLightShadows", true);
+            SetFieldOrProperty(asset, type, "m_SoftShadowsSupported", true);
+            SetFieldOrProperty(asset, type, "supportsSoftShadows", true);
+            SetFieldOrProperty(asset, type, "m_ShadowDistance", 220f);
+            SetFieldOrProperty(asset, type, "shadowDistance", 220f);
+            SetFieldOrProperty(asset, type, "m_MainLightShadowmapResolution", 4096);
+            SetFieldOrProperty(asset, type, "mainLightShadowmapResolution", 4096);
+            SetFieldOrProperty(asset, type, "m_ShadowCascadeCount", 2);
+            SetFieldOrProperty(asset, type, "shadowCascadeCount", 2);
+        }
+
+        private static void SetFieldOrProperty(object target, System.Type type, string name, object value)
+        {
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+            FieldInfo field = type.GetField(name, flags);
+            if (field != null)
+            {
+                try
+                {
+                    if (field.FieldType == typeof(int) && value is int) field.SetValue(target, value);
+                    else if (field.FieldType == typeof(float) && value is float) field.SetValue(target, value);
+                    else if (field.FieldType == typeof(bool) && value is bool) field.SetValue(target, value);
+                }
+                catch { }
+                return;
+            }
+
+            PropertyInfo property = type.GetProperty(name, flags);
+            if (property != null && property.CanWrite)
+            {
+                try
+                {
+                    if (property.PropertyType == typeof(int) && value is int) property.SetValue(target, value, null);
+                    else if (property.PropertyType == typeof(float) && value is float) property.SetValue(target, value, null);
+                    else if (property.PropertyType == typeof(bool) && value is bool) property.SetValue(target, value, null);
+                }
+                catch { }
+            }
+        }
+
+        private static Light GetOrCreateDirectionalLight(string objectName)
+        {
+            GameObject lightGo = GameObject.Find(objectName);
+            if (lightGo == null) lightGo = new GameObject(objectName);
+
+            Light light = lightGo.GetComponent<Light>();
+            if (light == null) light = lightGo.AddComponent<Light>();
+
+            light.type = LightType.Directional;
+            return light;
         }
 
         public void MarkTerrainDirty()

@@ -34,7 +34,16 @@ namespace MeteoriteSPH3D
         private void Awake()
         {
             controller = GetComponent<MeteoriteSPH3DController>();
-            if (controller == null) controller = FindObjectOfType<MeteoriteSPH3DController>();
+            if (controller == null) controller = FindExistingController();
+        }
+
+        private static MeteoriteSPH3DController FindExistingController()
+        {
+#if UNITY_2023_1_OR_NEWER
+            return UnityEngine.Object.FindFirstObjectByType<MeteoriteSPH3DController>();
+#else
+            return UnityEngine.Object.FindObjectOfType<MeteoriteSPH3DController>();
+#endif
         }
 
         private void Start()

@@ -287,7 +287,9 @@ void Integrate(uint3 id : SV_DispatchThreadID)
         p.velocity += (xsph / xsphW) * saturate(_XsphVelocityBlend) * saturate(dt * 8.0);
     }
 
-    p.velocity *= pow(_Damping, dt * 60.0);
+    float dampingBase = max(saturate(_Damping), 0.0001);
+    float dampingPower = max(dt * 60.0, 0.0);
+    p.velocity *= exp(log(dampingBase) * dampingPower);
     if (semiSolid) p.velocity *= lerp(1.0, _SemiSolidVelocityDamping, saturate(dt * 10.0));
 
     float speed = length(p.velocity);
