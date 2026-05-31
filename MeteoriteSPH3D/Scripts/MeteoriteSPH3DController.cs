@@ -24,17 +24,17 @@ namespace MeteoriteSPH3D
         [Header("GPU simulation")]
         public bool useGpuSimulation = true;
         public int gpuGridMaxParticlesPerCell = 160;
-        public int gpuReadbackInterval = 6;
+        public int gpuReadbackInterval = 3;
         [Tooltip("Use AsyncGPUReadback for particle state transfer. This avoids blocking the render thread while GPU particles are copied back for deposition.")]
         public bool useAsyncGpuReadback = true;
         [Tooltip("Upload modified voxel terrain back to the GPU only once per N solidification batches. Higher values reduce lag while particles are freezing.")]
-        public int gpuTerrainUploadInterval = 8;
+        public int gpuTerrainUploadInterval = 1;
         [Tooltip("Rebuild the visible voxel mesh only once per N frames while particles are freezing. Higher values reduce lag during deposition.")]
-        public int terrainMeshRebuildInterval = 2;
+        public int terrainMeshRebuildInterval = 1;
         [Tooltip("Voxel chunk side size used by the terrain renderer. 16 is a good default for this prototype.")]
         public int terrainChunkSize = 12;
         [Tooltip("Maximum number of voxel chunks rebuilt in one frame. Lower values reduce spikes; higher values update terrain faster.")]
-        public int maxTerrainChunkRebuildsPerFrame = 1;
+        public int maxTerrainChunkRebuildsPerFrame = 24;
         [Tooltip("MeshCollider for rebuilt chunks is refreshed only once per N frames. Physics particles use the voxel buffer, so visual mesh can update more often than colliders.")]
         public int terrainColliderUpdateInterval = 60;
 
@@ -134,16 +134,35 @@ namespace MeteoriteSPH3D
         public float maxDepositProminenceAboveNeighbours = 0.55f;
         public int minSameLevelNeighboursForProminentDeposit = 1;
         public float antiPillarProminencePenalty = 7.5f;
-        public int maxSolidifyPerFrame = 128;
+        public int maxSolidifyPerFrame = 4096;
         [Tooltip("Maximum number of particles checked for solidification in one frame. Prevents full-list scans when many particles exist.")]
-        public int maxSolidifyChecksPerFrame = 9000;
+        public int maxSolidifyChecksPerFrame = 50000;
+
+        [Header("Particle cleanup")]
+        [Tooltip("Force old, cold ejecta that is already lying near the surface to settle into voxels. This prevents a permanent carpet of particles around the crater.")]
+        public bool forceDepositOldParticles = true;
+        [Tooltip("Particle age after which fallback deposition can start.")]
+        public float forceDepositAge = 5.2f;
+        [Tooltip("Maximum speed for fallback deposition. Older particles get a slightly wider tolerance.")]
+        public float forceDepositMaxSpeed = 8.5f;
+        [Tooltip("Additional temperature allowance over solidifyTemperature for fallback deposition.")]
+        public float forceDepositTemperatureBonus = 500f;
+        [Tooltip("Maximum distance from a terrain surface, in voxel cells, where old particles may be snapped into voxels.")]
+        public float forceDepositGroundSnapDistanceCells = 6f;
+        [Tooltip("Search radius used for fallback deposition. Larger value helps particles scattered around the crater find the closest valid terrain column.")]
+        public int forcedDepositSearchRadiusCells = 7;
+
+        [Tooltip("When true, a particle is removed only after at least one new visible voxel is actually added to the terrain. Prevents cleanup from just hiding particles.")]
+        public bool removeParticleOnlyAfterVisibleVoxelDeposit = true;
+        [Tooltip("Additional tiny footprint for old fallback deposits. 0 means one voxel per particle; 1 makes scattered cleanup visibly affect the terrain, but can add more material.")]
+        public int forcedDepositFootprintRadiusCells = 0;
 
         [Header("Rim capture")]
         public bool rimCaptureEnabled = true;
         public float rimCaptureStartRadiusFactor = 0.58f;
         public float rimCaptureEndRadiusFactor = 1.55f;
         public float rimCaptureMaxSpeed = 7.20f;
-        public float rimCaptureMinAge = 0.55f;
+        public float rimCaptureMinAge = 1.20f;
         public float rimCaptureTemperatureBonus = 220f;
         public float outwardDepositBias = 0.20f;
         [Tooltip("Where the raised rim is preferred relative to impact radius. Values below 1 keep the wall close to the crater edge.")]
@@ -154,8 +173,8 @@ namespace MeteoriteSPH3D
         public int rimMinBelowFootprintSupport = 4;
 
         [Header("Raised rim sculpting")]
-        [Tooltip("Adds an explicit annular voxel rim immediately after impact. This makes the crater lip clearly visible even before all particles finish settling.")]
-        public bool sculptRaisedRimAfterImpact = true;
+        [Tooltip("Optional debug helper. When false, no artificial rim is added at impact time; the crater wall/rim forms only from simulated particles that later settle back into voxels.")]
+        public bool sculptRaisedRimAfterImpact = false;
         [Tooltip("Inner radius of the sculpted rim relative to impactRadius.")]
         public float sculptRimInnerRadiusFactor = 0.80f;
         [Tooltip("Radius where the sculpted rim reaches maximum height relative to impactRadius.")]
@@ -600,21 +619,27 @@ namespace MeteoriteSPH3D
             maxDepositProminenceAboveNeighbours = 0.55f;
             minSameLevelNeighboursForProminentDeposit = 1;
             antiPillarProminencePenalty = 7.5f;
-            maxSolidifyPerFrame = 128;
-            maxSolidifyChecksPerFrame = 9000;
-            gpuReadbackInterval = 6;
+            maxSolidifyPerFrame = 4096;
+            maxSolidifyChecksPerFrame = 50000;
+            forceDepositOldParticles = true;
+            forceDepositAge = 5.2f;
+            forceDepositMaxSpeed = 8.5f;
+            forceDepositTemperatureBonus = 500f;
+            forceDepositGroundSnapDistanceCells = 6f;
+            forcedDepositSearchRadiusCells = 7;
+            gpuReadbackInterval = 3;
             useAsyncGpuReadback = true;
-            gpuTerrainUploadInterval = 8;
-            terrainMeshRebuildInterval = 2;
+            gpuTerrainUploadInterval = 1;
+            terrainMeshRebuildInterval = 1;
             terrainChunkSize = 12;
-            maxTerrainChunkRebuildsPerFrame = 1;
+            maxTerrainChunkRebuildsPerFrame = 24;
             terrainColliderUpdateInterval = 60;
 
             rimCaptureEnabled = true;
             rimCaptureStartRadiusFactor = 0.58f;
             rimCaptureEndRadiusFactor = 1.55f;
             rimCaptureMaxSpeed = 7.20f;
-            rimCaptureMinAge = 0.55f;
+            rimCaptureMinAge = 1.20f;
             rimCaptureTemperatureBonus = 220f;
             outwardDepositBias = 0.20f;
             rimDepositTargetRadiusFactor = 1.00f;
@@ -623,7 +648,8 @@ namespace MeteoriteSPH3D
             rimProminenceAllowanceBonus = 5.50f;
             rimMinBelowFootprintSupport = 4;
 
-            sculptRaisedRimAfterImpact = true;
+            // Keep this disabled for physical-looking behavior: the rim should appear from particle deposition, not from an instant terrain sculpt.
+            sculptRaisedRimAfterImpact = false;
             sculptRimInnerRadiusFactor = 0.80f;
             sculptRimPeakRadiusFactor = 1.02f;
             sculptRimOuterRadiusFactor = 1.24f;
@@ -1187,20 +1213,27 @@ namespace MeteoriteSPH3D
                 bool normal = p.age >= solidifyMinAge && p.temperature <= solidifyTemperature && speed <= solidifySpeed && p.recentGroundContact > 0f;
                 bool center = IsCenterCaptureAllowed(p, speed);
                 bool rim = IsRimCaptureAllowed(p, speed);
+                bool forced = IsForcedDepositAllowed(p, speed);
 
-                if (normal || center || rim)
+                if (normal || center || rim || forced)
                 {
                     Vector3Int deposit;
-                    if (FindDepositCell(p.position, rim, center, out deposit))
+                    if (FindDepositCell(p.position, rim, center, forced, out deposit))
                     {
-                        terrain.SetSolid(deposit.x, deposit.y, deposit.z, true, p.temperature, 0f, 0.1f, true);
-                        if (UseGpuSimulation && p.gpuIndex >= 0) pendingGpuDeactivateIndices.Add(p.gpuIndex);
-                        RemoveParticleAtSwap(i);
-                        solidified++;
-                        terrainDirty = true;
-                        gpuTerrainDirty = true;
-                        i--;
-                        continue;
+                        int placedVoxels = DepositParticleMaterial(deposit, Mathf.Min(p.temperature, sculptRimTemperature), rim, center, forced);
+                        if (!removeParticleOnlyAfterVisibleVoxelDeposit || placedVoxels > 0)
+                        {
+                            if (UseGpuSimulation && p.gpuIndex >= 0) pendingGpuDeactivateIndices.Add(p.gpuIndex);
+                            RemoveParticleAtSwap(i);
+                            solidified++;
+                            terrainDirty = true;
+                            gpuTerrainDirty = true;
+                            // Do not wait several frames/chunks after cleanup: make voxel deposition visible immediately.
+                            terrainMeshDirtyFrames = terrainMeshRebuildInterval;
+                            gpuTerrainDirtyFrames = gpuTerrainUploadInterval;
+                            i--;
+                            continue;
+                        }
                     }
                 }
 
@@ -1209,6 +1242,46 @@ namespace MeteoriteSPH3D
 
             solidifyScanCursor = i;
             return solidified;
+        }
+
+        private int DepositParticleMaterial(Vector3Int mainCell, float temperature, bool rim, bool center, bool forced)
+        {
+            if (terrain == null) return 0;
+
+            int placed = 0;
+            int footprint = forced ? Mathf.Clamp(forcedDepositFootprintRadiusCells, 0, 1) : 0;
+            float temp = Mathf.Max(1f, temperature);
+
+            for (int dz = -footprint; dz <= footprint; dz++)
+            {
+                for (int dx = -footprint; dx <= footprint; dx++)
+                {
+                    if (Mathf.Abs(dx) + Mathf.Abs(dz) > footprint) continue;
+
+                    int x = mainCell.x + dx;
+                    int z = mainCell.z + dz;
+                    if (x < 0 || x >= terrain.Width || z < 0 || z >= terrain.Depth) continue;
+
+                    int y;
+                    if (dx == 0 && dz == 0)
+                    {
+                        y = mainCell.y;
+                    }
+                    else
+                    {
+                        int top = terrain.TopSolidY(x, z);
+                        if (top < 0 || top >= terrain.Height - 1) continue;
+                        y = top + 1;
+                    }
+
+                    if (!terrain.InBounds(x, y, z) || terrain.IsSolid(x, y, z)) continue;
+
+                    terrain.SetSolid(x, y, z, true, temp, 0f, 0.1f, true);
+                    placed++;
+                }
+            }
+
+            return placed;
         }
 
         private bool IsCenterCaptureAllowed(SPHParticle3D p, float speed)
@@ -1229,6 +1302,55 @@ namespace MeteoriteSPH3D
             if (r < lastImpactRadius * rimCaptureStartRadiusFactor || r > lastImpactRadius * rimCaptureEndRadiusFactor) return false;
             if (speed > rimCaptureMaxSpeed) return false;
             return p.temperature <= solidifyTemperature + rimCaptureTemperatureBonus;
+        }
+
+        private bool IsForcedDepositAllowed(SPHParticle3D p, float speed)
+        {
+            if (!forceDepositOldParticles || p == null || terrain == null) return false;
+            if (p.age < forceDepositAge) return false;
+
+            bool coldEnough = p.temperature <= solidifyTemperature + forceDepositTemperatureBonus;
+            if (!coldEnough) return false;
+
+            float speedLimit = Mathf.Max(forceDepositMaxSpeed, solidifySpeed);
+            if (p.age >= forceDepositAge * 1.8f) speedLimit *= 1.75f;
+            if (p.age >= forceDepositAge * 2.8f) speedLimit *= 2.50f;
+            if (speed > speedLimit) return false;
+
+            // recentGroundContact is short-lived and can expire between sparse GPU readbacks.
+            // For old particles, also accept positions that are physically close to the top of the voxel terrain.
+            return p.recentGroundContact > 0f || IsNearTerrainSurface(p.position, forceDepositGroundSnapDistanceCells);
+        }
+
+        private bool IsNearTerrainSurface(Vector3 position, float maxDistanceCells)
+        {
+            if (terrain == null) return false;
+
+            Vector3Int c = terrain.WorldToCell(position);
+            int radius = Mathf.Max(1, Mathf.CeilToInt(maxDistanceCells));
+            float maxWorldDistance = Mathf.Max(cellSize, maxDistanceCells * cellSize);
+
+            for (int z = c.z - radius; z <= c.z + radius; z++)
+            {
+                for (int x = c.x - radius; x <= c.x + radius; x++)
+                {
+                    if (x < 0 || x >= terrain.Width || z < 0 || z >= terrain.Depth) continue;
+
+                    int top = terrain.TopSolidY(x, z);
+                    if (top < 0) continue;
+
+                    Vector3 surface = terrain.CellCenter(x, top, z);
+                    surface.y = (top + 1) * terrain.CellSize;
+                    float horizontal = Vector2.Distance(new Vector2(position.x, position.z), new Vector2(surface.x, surface.z));
+                    if (horizontal > maxWorldDistance) continue;
+
+                    float vertical = Mathf.Abs(position.y - surface.y);
+                    if (vertical <= maxWorldDistance + horizontal * 0.20f && position.y >= surface.y - terrain.CellSize * 2.0f)
+                        return true;
+                }
+            }
+
+            return false;
         }
 
         private int TopSolidYInColumn(int x, int z)
@@ -1279,14 +1401,14 @@ namespace MeteoriteSPH3D
             return true;
         }
 
-        private bool FindDepositCell(Vector3 position, bool rim, bool center, out Vector3Int best)
+        private bool FindDepositCell(Vector3 position, bool rim, bool center, bool forced, out Vector3Int best)
         {
             best = Vector3Int.zero;
             if (terrain == null) return false;
 
             Vector3Int c0 = terrain.WorldToCell(position);
             float bestScore = float.PositiveInfinity;
-            int radius = Mathf.Max(1, depositSearchRadiusCells);
+            int radius = Mathf.Max(1, forced ? Mathf.Max(depositSearchRadiusCells, forcedDepositSearchRadiusCells) : depositSearchRadiusCells);
 
             for (int z = c0.z - radius; z <= c0.z + radius; z++)
             {
@@ -1313,11 +1435,12 @@ namespace MeteoriteSPH3D
                             if (terrain.IsSolid(x + ox, y - 1, z + oz)) belowFootprintSupport++;
                         }
                     }
-                    int requiredFootprint = center ? Mathf.Max(1, minBelowFootprintSupport - 1) : Mathf.Max(1, minBelowFootprintSupport);
+                    int requiredFootprint = forced ? 1 : (center ? Mathf.Max(1, minBelowFootprintSupport - 1) : Mathf.Max(1, minBelowFootprintSupport));
                     if (belowFootprintSupport < requiredFootprint) continue;
 
                     int neighbourTopY = MaxNeighbourTopY(x, z);
                     int allowedRiseAboveNeighbours = rim ? Mathf.Max(maxDepositRiseAboveNeighbours, ComputeRimDepositRiseLimit()) : Mathf.Max(0, maxDepositRiseAboveNeighbours);
+                    if (forced) allowedRiseAboveNeighbours = Mathf.Max(allowedRiseAboveNeighbours, 2);
                     if (neighbourTopY >= 0 && y > neighbourTopY + allowedRiseAboveNeighbours) continue;
 
                     float averageNeighbourTopY;
@@ -1331,6 +1454,7 @@ namespace MeteoriteSPH3D
                         float allowedProminence = maxDepositProminenceAboveNeighbours;
                         if (rim) allowedProminence += rimProminenceAllowanceBonus;
                         if (center) allowedProminence += 0.15f;
+                        if (forced) allowedProminence += 0.85f;
                         if (localProminence > allowedProminence) continue;
                     }
 
@@ -1343,21 +1467,23 @@ namespace MeteoriteSPH3D
                     if (antiPillarDepositEnabled && hasNeighbourStats && localProminence > 0.25f && sameLevelCardinalSupport < Mathf.Max(0, minSameLevelNeighboursForProminentDeposit))
                     {
                         bool supportedRimStart = rim && belowFootprintSupport >= Mathf.Max(1, rimMinBelowFootprintSupport) && localProminence <= rimProminenceAllowanceBonus;
-                        if (!supportedRimStart) continue;
+                        bool supportedForcedDeposit = forced && belowFootprintSupport >= 1 && localProminence <= maxDepositProminenceAboveNeighbours + 0.85f;
+                        if (!supportedRimStart && !supportedForcedDeposit) continue;
                     }
 
                     Vector3 cp = terrain.CellCenter(x, y, z);
                     float verticalPenalty = Mathf.Abs(cp.y - position.y) * 0.35f;
                     float upwardPenalty = Mathf.Max(0f, cp.y - position.y) * 1.2f;
-                    float score = horizontalCellDist * 2.8f + verticalPenalty + upwardPenalty;
+                    float score = horizontalCellDist * (forced ? 1.65f : 2.8f) + verticalPenalty + upwardPenalty;
 
-                    score -= 0.25f;
+                    score -= forced ? 0.80f : 0.25f;
                     score -= Mathf.Min(0.75f, (belowFootprintSupport - 1) * 0.10f);
                     score -= Mathf.Min(0.40f, sameLevelCardinalSupport * 0.10f);
                     if (antiPillarDepositEnabled && hasNeighbourStats)
                     {
-                        score += Mathf.Max(0f, localProminence) * antiPillarProminencePenalty;
-                        if (sameLevelCardinalSupport == 0) score += 1.4f;
+                        float prominencePenaltyMul = forced ? 0.35f : 1f;
+                        score += Mathf.Max(0f, localProminence) * antiPillarProminencePenalty * prominencePenaltyMul;
+                        if (sameLevelCardinalSupport == 0) score += forced ? 0.45f : 1.4f;
                     }
 
                     if (hasImpact)
