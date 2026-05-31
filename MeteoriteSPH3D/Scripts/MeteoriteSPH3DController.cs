@@ -50,11 +50,17 @@ namespace MeteoriteSPH3D
         public bool damageCanActivateVoxels = false;
         public float impactImpulse = 304f;
         public float horizontalEjectaBias = 12.40f;
-        public float upwardBias = 0.92f;
-        public float rimEjectaBoost = 9.20f;
+        public float upwardBias = 1.08f;
+        public float rimEjectaBoost = 11.50f;
         public float centralLiftSuppression = 0.42f;
+        [Tooltip("Manual fallback depth below the clicked surface when automatic depth scaling is disabled.")]
         public float shockDepth = 0f;
+        [Tooltip("When true, the impact ellipsoid is centered exactly at the click point. When false, it is moved below the surface along the local normal.")]
         public bool useMouseClickAsImpactCenter = true;
+        [Tooltip("When enabled, the impact center depth is computed from impactRadius. Disabled by default so the explosion center stays at the clicked surface point.")]
+        public bool autoScaleShockDepthWithRadius = false;
+        [Tooltip("Impact center depth as a fraction of crater radius. Keep 0 to leave the impact center at the clicked surface point.")]
+        public float shockDepthToRadiusRatio = 0f;
         public float impactVerticalScale = 0.36f;
         [Tooltip("When true, the pressure/temperature impact field is an ellipsoid oriented by the locally estimated terrain normal at the click point.")]
         public bool impactUseEllipsoid = true;
@@ -128,24 +134,50 @@ namespace MeteoriteSPH3D
         public float maxDepositProminenceAboveNeighbours = 0.55f;
         public int minSameLevelNeighboursForProminentDeposit = 1;
         public float antiPillarProminencePenalty = 7.5f;
-        public int maxSolidifyPerFrame = 64;
+        public int maxSolidifyPerFrame = 128;
         [Tooltip("Maximum number of particles checked for solidification in one frame. Prevents full-list scans when many particles exist.")]
-        public int maxSolidifyChecksPerFrame = 5000;
+        public int maxSolidifyChecksPerFrame = 9000;
 
         [Header("Rim capture")]
         public bool rimCaptureEnabled = true;
-        public float rimCaptureStartRadiusFactor = 0.42f;
-        public float rimCaptureEndRadiusFactor = 2.10f;
-        public float rimCaptureMaxSpeed = 4.60f;
-        public float rimCaptureMinAge = 0.75f;
-        public float rimCaptureTemperatureBonus = 170f;
-        public float outwardDepositBias = 1.35f;
+        public float rimCaptureStartRadiusFactor = 0.58f;
+        public float rimCaptureEndRadiusFactor = 1.55f;
+        public float rimCaptureMaxSpeed = 7.20f;
+        public float rimCaptureMinAge = 0.55f;
+        public float rimCaptureTemperatureBonus = 220f;
+        public float outwardDepositBias = 0.20f;
         [Tooltip("Where the raised rim is preferred relative to impact radius. Values below 1 keep the wall close to the crater edge.")]
-        public float rimDepositTargetRadiusFactor = 0.92f;
-        public float rimDepositTargetBias = 2.40f;
-        public int rimMaxDepositRiseAboveNeighbours = 3;
-        public float rimProminenceAllowanceBonus = 2.25f;
-        public int rimMinBelowFootprintSupport = 5;
+        public float rimDepositTargetRadiusFactor = 1.00f;
+        public float rimDepositTargetBias = 6.40f;
+        public int rimMaxDepositRiseAboveNeighbours = 7;
+        public float rimProminenceAllowanceBonus = 5.50f;
+        public int rimMinBelowFootprintSupport = 4;
+
+        [Header("Raised rim sculpting")]
+        [Tooltip("Adds an explicit annular voxel rim immediately after impact. This makes the crater lip clearly visible even before all particles finish settling.")]
+        public bool sculptRaisedRimAfterImpact = true;
+        [Tooltip("Inner radius of the sculpted rim relative to impactRadius.")]
+        public float sculptRimInnerRadiusFactor = 0.80f;
+        [Tooltip("Radius where the sculpted rim reaches maximum height relative to impactRadius.")]
+        public float sculptRimPeakRadiusFactor = 1.02f;
+        [Tooltip("Outer radius of the sculpted rim relative to impactRadius.")]
+        public float sculptRimOuterRadiusFactor = 1.24f;
+        [Tooltip("Fallback maximum added rim height in voxel cells. Used when automatic radius scaling is disabled.")]
+        public int sculptRimPeakHeightCells = 11;
+        [Tooltip("When enabled, the raised rim height is computed from impactRadius, so larger craters automatically get taller walls.")]
+        public bool autoScaleRimHeightWithRadius = true;
+        [Tooltip("Rim height as a fraction of crater radius measured in voxel cells. Real simple-crater rim height is about 0.07R; 0.10 keeps it readable in voxels without making a tower.")]
+        public float rimHeightToRadiusRatio = 0.10f;
+        [Tooltip("Lower clamp for automatically computed rim height.")]
+        public int minAutoRimHeightCells = 4;
+        [Tooltip("Upper clamp for automatically computed rim height. Keeps very large craters from forming absurd towers.")]
+        public int maxAutoRimHeightCells = 16;
+        [Tooltip("Apply the same radius-based height limit to particles that later settle onto the raised rim.")]
+        public bool autoScaleRimDepositHeightWithRadius = true;
+        [Tooltip("Small irregularity so the rim does not look like a perfectly mathematical torus.")]
+        public float sculptRimNoiseStrength = 0.22f;
+        [Tooltip("Temperature assigned to the freshly raised rim voxels so they render as deposited material.")]
+        public float sculptRimTemperature = 95f;
 
         [Header("Center capture")]
         public bool centerCaptureEnabled = true;
@@ -502,11 +534,13 @@ namespace MeteoriteSPH3D
             damageCanActivateVoxels = false;
             impactImpulse = 304f;
             horizontalEjectaBias = 12.40f;
-            upwardBias = 0.92f;
+            upwardBias = 1.08f;
             centralLiftSuppression = 0.42f;
             rimEjectaBoost = 9.20f;
             shockDepth = 0f;
             useMouseClickAsImpactCenter = true;
+            autoScaleShockDepthWithRadius = false;
+            shockDepthToRadiusRatio = 0f;
             impactVerticalScale = 0.36f;
             impactUseEllipsoid = true;
             useLocalVoxelNormalForImpact = true;
@@ -566,8 +600,8 @@ namespace MeteoriteSPH3D
             maxDepositProminenceAboveNeighbours = 0.55f;
             minSameLevelNeighboursForProminentDeposit = 1;
             antiPillarProminencePenalty = 7.5f;
-            maxSolidifyPerFrame = 64;
-            maxSolidifyChecksPerFrame = 5000;
+            maxSolidifyPerFrame = 128;
+            maxSolidifyChecksPerFrame = 9000;
             gpuReadbackInterval = 6;
             useAsyncGpuReadback = true;
             gpuTerrainUploadInterval = 8;
@@ -577,17 +611,30 @@ namespace MeteoriteSPH3D
             terrainColliderUpdateInterval = 60;
 
             rimCaptureEnabled = true;
-            rimCaptureStartRadiusFactor = 0.42f;
-            rimCaptureEndRadiusFactor = 2.10f;
-            rimCaptureMaxSpeed = 4.60f;
-            rimCaptureMinAge = 0.75f;
-            rimCaptureTemperatureBonus = 170f;
-            outwardDepositBias = 1.35f;
-            rimDepositTargetRadiusFactor = 0.92f;
-            rimDepositTargetBias = 2.40f;
-            rimMaxDepositRiseAboveNeighbours = 3;
-            rimProminenceAllowanceBonus = 2.25f;
-            rimMinBelowFootprintSupport = 5;
+            rimCaptureStartRadiusFactor = 0.58f;
+            rimCaptureEndRadiusFactor = 1.55f;
+            rimCaptureMaxSpeed = 7.20f;
+            rimCaptureMinAge = 0.55f;
+            rimCaptureTemperatureBonus = 220f;
+            outwardDepositBias = 0.20f;
+            rimDepositTargetRadiusFactor = 1.00f;
+            rimDepositTargetBias = 6.40f;
+            rimMaxDepositRiseAboveNeighbours = 7;
+            rimProminenceAllowanceBonus = 5.50f;
+            rimMinBelowFootprintSupport = 4;
+
+            sculptRaisedRimAfterImpact = true;
+            sculptRimInnerRadiusFactor = 0.80f;
+            sculptRimPeakRadiusFactor = 1.02f;
+            sculptRimOuterRadiusFactor = 1.24f;
+            sculptRimPeakHeightCells = 11;
+            autoScaleRimHeightWithRadius = true;
+            rimHeightToRadiusRatio = 0.10f;
+            minAutoRimHeightCells = 3;
+            maxAutoRimHeightCells = 16;
+            autoScaleRimDepositHeightWithRadius = true;
+            sculptRimNoiseStrength = 0.22f;
+            sculptRimTemperature = 95f;
 
             centerCaptureEnabled = true;
             centerCaptureRadiusFactor = 0.36f;
@@ -887,6 +934,16 @@ namespace MeteoriteSPH3D
             tangentB = Vector3.Cross(n, tangentA).normalized;
         }
 
+        private float ComputeImpactCenterDepth()
+        {
+            if (useMouseClickAsImpactCenter) return 0f;
+            if (autoScaleShockDepthWithRadius)
+            {
+                return Mathf.Max(0f, impactRadius * Mathf.Max(0f, shockDepthToRadiusRatio));
+            }
+            return Mathf.Max(0f, shockDepth);
+        }
+
         private void ApplyImpact(Vector3 hitPoint)
         {
             // New impact appends particles on CPU. Sync once on click so we do not overwrite
@@ -904,7 +961,8 @@ namespace MeteoriteSPH3D
             Vector3 tangentB;
             BuildImpactBasis(impactNormal, out tangentA, out tangentB);
 
-            Vector3 center = useMouseClickAsImpactCenter ? hitPoint : hitPoint - impactNormal * shockDepth;
+            float centerDepth = ComputeImpactCenterDepth();
+            Vector3 center = hitPoint - impactNormal * centerDepth;
             lastImpactCenter = center;
             lastImpactRadius = impactRadius;
             hasImpact = true;
@@ -960,6 +1018,11 @@ namespace MeteoriteSPH3D
                 }
             }
 
+            if (sculptRaisedRimAfterImpact)
+            {
+                SculptRaisedRim(center, impactRadius);
+            }
+
             LastCreatedParticles = created;
             TotalCreatedParticles += created;
 
@@ -976,6 +1039,86 @@ namespace MeteoriteSPH3D
                 float uploadParticlesStartMs = Time.realtimeSinceStartup * 1000f;
                 gpuSolver.UploadFromParticles(particles);
                 LastGpuParticleUploadMs += Time.realtimeSinceStartup * 1000f - uploadParticlesStartMs;
+            }
+        }
+
+        private int ComputeScaledRimHeightCells(float radius)
+        {
+            if (terrain == null) return Mathf.Max(0, sculptRimPeakHeightCells);
+
+            if (!autoScaleRimHeightWithRadius)
+            {
+                return Mathf.Clamp(sculptRimPeakHeightCells, 0, terrain.Height - 2);
+            }
+
+            float radiusCells = radius / Mathf.Max(0.0001f, cellSize);
+            int computed = Mathf.RoundToInt(radiusCells * Mathf.Max(0f, rimHeightToRadiusRatio));
+            int minHeight = Mathf.Max(0, minAutoRimHeightCells);
+            int maxHeight = Mathf.Max(minHeight, maxAutoRimHeightCells);
+            return Mathf.Clamp(computed, minHeight, Mathf.Min(maxHeight, terrain.Height - 2));
+        }
+
+        private int ComputeRimDepositRiseLimit()
+        {
+            int fixedLimit = Mathf.Max(0, rimMaxDepositRiseAboveNeighbours);
+            if (!autoScaleRimDepositHeightWithRadius || terrain == null) return fixedLimit;
+            return Mathf.Max(fixedLimit, ComputeScaledRimHeightCells(lastImpactRadius));
+        }
+
+        private void SculptRaisedRim(Vector3 center, float radius)
+        {
+            if (terrain == null || radius <= 0.001f) return;
+
+            float inner = Mathf.Max(cellSize, radius * Mathf.Clamp(sculptRimInnerRadiusFactor, 0.10f, 2.0f));
+            float peak = Mathf.Max(inner + cellSize, radius * Mathf.Clamp(sculptRimPeakRadiusFactor, 0.10f, 2.5f));
+            float outer = Mathf.Max(peak + cellSize, radius * Mathf.Clamp(sculptRimOuterRadiusFactor, 0.10f, 3.0f));
+            int peakHeight = ComputeScaledRimHeightCells(radius);
+            if (peakHeight <= 0) return;
+
+            Vector3Int min = terrain.WorldToCell(center - new Vector3(outer, 0f, outer));
+            Vector3Int max = terrain.WorldToCell(center + new Vector3(outer, 0f, outer));
+            min.x = Mathf.Clamp(min.x, 0, terrain.Width - 1);
+            min.z = Mathf.Clamp(min.z, 0, terrain.Depth - 1);
+            max.x = Mathf.Clamp(max.x, 0, terrain.Width - 1);
+            max.z = Mathf.Clamp(max.z, 0, terrain.Depth - 1);
+
+            for (int z = min.z; z <= max.z; z++)
+            {
+                for (int x = min.x; x <= max.x; x++)
+                {
+                    Vector3 cp = terrain.CellCenter(x, 0, z);
+                    float dx = cp.x - center.x;
+                    float dz = cp.z - center.z;
+                    float r = Mathf.Sqrt(dx * dx + dz * dz);
+                    if (r < inner || r > outer) continue;
+
+                    float profile;
+                    if (r <= peak)
+                    {
+                        profile = Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(inner, peak, r));
+                    }
+                    else
+                    {
+                        profile = Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(outer, peak, r));
+                    }
+
+                    if (profile <= 0.02f) continue;
+
+                    float noise = Mathf.PerlinNoise(x * 0.173f + 31.7f, z * 0.173f + 91.3f) * 2f - 1f;
+                    float noisyProfile = Mathf.Clamp01(profile * (1f + noise * Mathf.Clamp01(sculptRimNoiseStrength)));
+                    int extraCells = Mathf.RoundToInt(noisyProfile * peakHeight);
+                    if (profile > 0.18f) extraCells = Mathf.Max(1, extraCells);
+                    if (extraCells <= 0) continue;
+
+                    int top = terrain.TopSolidY(x, z);
+                    if (top < 0 || top >= terrain.Height - 2) continue;
+
+                    int yMax = Mathf.Min(terrain.Height - 2, top + extraCells);
+                    for (int y = top + 1; y <= yMax; y++)
+                    {
+                        terrain.SetSolid(x, y, z, true, sculptRimTemperature, 0f, 0.15f, true);
+                    }
+                }
             }
         }
 
@@ -1174,7 +1317,7 @@ namespace MeteoriteSPH3D
                     if (belowFootprintSupport < requiredFootprint) continue;
 
                     int neighbourTopY = MaxNeighbourTopY(x, z);
-                    int allowedRiseAboveNeighbours = rim ? Mathf.Max(maxDepositRiseAboveNeighbours, rimMaxDepositRiseAboveNeighbours) : Mathf.Max(0, maxDepositRiseAboveNeighbours);
+                    int allowedRiseAboveNeighbours = rim ? Mathf.Max(maxDepositRiseAboveNeighbours, ComputeRimDepositRiseLimit()) : Mathf.Max(0, maxDepositRiseAboveNeighbours);
                     if (neighbourTopY >= 0 && y > neighbourTopY + allowedRiseAboveNeighbours) continue;
 
                     float averageNeighbourTopY;
