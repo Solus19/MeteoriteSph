@@ -11,13 +11,13 @@ namespace MeteoriteSPH3D
         public static MeteoriteSPH3DController Instance { get; private set; }
 
         [Header("Voxel terrain")]
-        public int terrainWidth = 120;
-        public int terrainHeight = 64;
-        public int terrainDepth = 120;
+        public int terrainWidth = 240;
+        public int terrainHeight = 128;
+        public int terrainDepth = 240;
         public float cellSize = 0.35f;
-        public int baseHeight = 12;
+        public int baseHeight = 24;
         public bool useReliefTerrain = false;
-        public int reliefAmplitudeCells = 22;
+        public int reliefAmplitudeCells = 44;
         public float reliefNoiseScale = 0.085f;
         public int reliefSeed = 23;
 
@@ -39,7 +39,7 @@ namespace MeteoriteSPH3D
         public int terrainColliderUpdateInterval = 60;
 
         [Header("Impact")]
-        public float impactRadius = 8.60f;
+        public float impactRadius = 17.20f;
         public float impactPressure = 470f;
         public float pressureThreshold = 52f;
         public float impactTemperature = 860f;
@@ -48,7 +48,7 @@ namespace MeteoriteSPH3D
         public float damageThreshold = 0.56f;
         public float damageScale = 1.55f;
         public bool damageCanActivateVoxels = false;
-        public float impactImpulse = 152f;
+        public float impactImpulse = 304f;
         public float horizontalEjectaBias = 12.40f;
         public float upwardBias = 0.92f;
         public float rimEjectaBoost = 9.20f;
@@ -63,8 +63,8 @@ namespace MeteoriteSPH3D
         public int localNormalSampleRadiusCells = 3;
         [Tooltip("Debug only. When false, voxels are converted to particles only after pressure/temperature thresholds are exceeded.")]
         public bool impactActivateAllVoxelsInside = false;
-        public int maxParticles = 220000;
-        public int maxCreatedParticlesPerImpact = 90000;
+        public int maxParticles = 500000;
+        public int maxCreatedParticlesPerImpact = 320000;
 
         [Header("SPH")]
         public float smoothingRadius = 0.95f;
@@ -88,13 +88,13 @@ namespace MeteoriteSPH3D
         public float gravity = 15.0f;
         public float damping = 0.996f;
         public float collisionFriction = 0.985f;
-        public float maxVelocity = 85.0f;
-        public float maxAcceleration = 9000.0f;
+        public float maxVelocity = 170.0f;
+        public float maxAcceleration = 18000.0f;
         public float timeStep = 1f / 90f;
         public int substeps = 5;
         public float coolingRate = 2.2f;
         public float groundCoolingRate = 60f;
-        public float extraWorldHeight = 10f;
+        public float extraWorldHeight = 20f;
 
         [Header("Visco-plastic ejecta")]
         public bool useViscoPlasticEjecta = true;
@@ -128,9 +128,9 @@ namespace MeteoriteSPH3D
         public float maxDepositProminenceAboveNeighbours = 0.55f;
         public int minSameLevelNeighboursForProminentDeposit = 1;
         public float antiPillarProminencePenalty = 7.5f;
-        public int maxSolidifyPerFrame = 32;
+        public int maxSolidifyPerFrame = 64;
         [Tooltip("Maximum number of particles checked for solidification in one frame. Prevents full-list scans when many particles exist.")]
-        public int maxSolidifyChecksPerFrame = 2500;
+        public int maxSolidifyChecksPerFrame = 5000;
 
         [Header("Rim capture")]
         public bool rimCaptureEnabled = true;
@@ -227,7 +227,7 @@ namespace MeteoriteSPH3D
             mainCamera.clearFlags = CameraClearFlags.SolidColor;
             mainCamera.backgroundColor = new Color(0.68f, 0.76f, 0.86f, 1f);
             mainCamera.nearClipPlane = 0.03f;
-            mainCamera.farClipPlane = 400f;
+            mainCamera.farClipPlane = 800f;
             // Do not force legacy camera depth textures here. URP shadow maps are used by the voxel shader,
             // and the shader deliberately avoids screen-space shadows to prevent depth-buffer CommandBuffer warnings.
             mainCamera.depthTextureMode = DepthTextureMode.None;
@@ -265,7 +265,7 @@ namespace MeteoriteSPH3D
             // Cast Shadows and Receive Shadows enabled, and the vertex-color shader
             // now has proper Built-in + URP shadow passes.
             QualitySettings.shadows = ShadowQuality.All;
-            QualitySettings.shadowDistance = 220f;
+            QualitySettings.shadowDistance = 440f;
             QualitySettings.shadowResolution = ShadowResolution.High;
             QualitySettings.shadowCascades = 2;
             QualitySettings.shadowProjection = ShadowProjection.StableFit;
@@ -305,8 +305,8 @@ namespace MeteoriteSPH3D
             SetFieldOrProperty(asset, type, "supportsMainLightShadows", true);
             SetFieldOrProperty(asset, type, "m_SoftShadowsSupported", true);
             SetFieldOrProperty(asset, type, "supportsSoftShadows", true);
-            SetFieldOrProperty(asset, type, "m_ShadowDistance", 220f);
-            SetFieldOrProperty(asset, type, "shadowDistance", 220f);
+            SetFieldOrProperty(asset, type, "m_ShadowDistance", 440f);
+            SetFieldOrProperty(asset, type, "shadowDistance", 440f);
             SetFieldOrProperty(asset, type, "m_MainLightShadowmapResolution", 4096);
             SetFieldOrProperty(asset, type, "mainLightShadowmapResolution", 4096);
             SetFieldOrProperty(asset, type, "m_ShadowCascadeCount", 2);
@@ -482,10 +482,16 @@ namespace MeteoriteSPH3D
 
         public void ApplyCraterRimPreset()
         {
-            // Bigger crater preset: wider and stronger impact, still shallow vertically to avoid drilling to the bottom.
+            // 2x large crater preset: wider terrain and stronger impact while keeping voxel resolution unchanged.
             // Does not force relief terrain, so flat-surface tests stay flat unless the menu toggle is enabled.
+            terrainWidth = 240;
+            terrainHeight = 128;
+            terrainDepth = 240;
+            baseHeight = 24;
+            reliefAmplitudeCells = 44;
+            extraWorldHeight = 20f;
             useReliefTerrain = false;
-            impactRadius = 8.60f;
+            impactRadius = 17.20f;
             impactPressure = 470f;
             pressureThreshold = 52f;
             impactTemperature = 860f;
@@ -494,7 +500,7 @@ namespace MeteoriteSPH3D
             damageThreshold = 0.56f;
             damageScale = 1.55f;
             damageCanActivateVoxels = false;
-            impactImpulse = 152f;
+            impactImpulse = 304f;
             horizontalEjectaBias = 12.40f;
             upwardBias = 0.92f;
             centralLiftSuppression = 0.42f;
@@ -506,8 +512,8 @@ namespace MeteoriteSPH3D
             useLocalVoxelNormalForImpact = true;
             localNormalSampleRadiusCells = 3;
             impactActivateAllVoxelsInside = false;
-            maxParticles = 220000;
-            maxCreatedParticlesPerImpact = 90000;
+            maxParticles = 500000;
+            maxCreatedParticlesPerImpact = 320000;
             gpuGridMaxParticlesPerCell = 160;
 
             smoothingRadius = 0.95f;
@@ -532,8 +538,8 @@ namespace MeteoriteSPH3D
             gravity = 15.0f;
             damping = 0.996f;
             collisionFriction = 0.985f;
-            maxVelocity = 85.0f;
-            maxAcceleration = 9000.0f;
+            maxVelocity = 170.0f;
+            maxAcceleration = 18000.0f;
             timeStep = 1f / 90f;
             substeps = 5;
             coolingRate = 2.2f;
@@ -560,8 +566,8 @@ namespace MeteoriteSPH3D
             maxDepositProminenceAboveNeighbours = 0.55f;
             minSameLevelNeighboursForProminentDeposit = 1;
             antiPillarProminencePenalty = 7.5f;
-            maxSolidifyPerFrame = 32;
-            maxSolidifyChecksPerFrame = 2500;
+            maxSolidifyPerFrame = 64;
+            maxSolidifyChecksPerFrame = 5000;
             gpuReadbackInterval = 6;
             useAsyncGpuReadback = true;
             gpuTerrainUploadInterval = 8;

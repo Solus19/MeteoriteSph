@@ -47,7 +47,7 @@ namespace MeteoriteSPH3D
             {
                 float zoomMul = fast ? fastZoomMultiplier : 1f;
                 float zoomAmount = scroll * zoomSpeed * zoomMul * Mathf.Max(1f, distance * 0.12f);
-                distance = Mathf.Clamp(distance - zoomAmount, 2.5f, 180f);
+                distance = Mathf.Clamp(distance - zoomAmount, 2.5f, 360f);
             }
 
             if (InputBridge3D.KeyDown(KeyCode.F))
