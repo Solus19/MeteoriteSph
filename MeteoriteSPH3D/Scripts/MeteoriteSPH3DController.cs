@@ -27,8 +27,25 @@ namespace MeteoriteSPH3D
         public int gpuReadbackInterval = 3;
         [Tooltip("Use AsyncGPUReadback for particle state transfer. This avoids blocking the render thread while GPU particles are copied back for deposition.")]
         public bool useAsyncGpuReadback = true;
+        [Tooltip("When enabled, GPU sends only broad deposit candidates to CPU instead of downloading the full particle buffer every readback interval.")]
+        public bool useGpuDepositCandidateReadback = true;
+        [Tooltip("Maximum number of potential deposit particles copied from GPU to CPU per readback. Increase if very large impacts stop depositing material fast enough.")]
+        public int gpuDepositCandidateCapacity = 8192;
         [Tooltip("Upload modified voxel terrain back to the GPU only once per N solidification batches. Higher values reduce lag while particles are freezing.")]
         public int gpuTerrainUploadInterval = 1;
+        [Tooltip("After a fresh impact keep the original substep count for a short burst, then drop to cheaper substeps as the ejecta slows down.")]
+        public bool adaptiveSubsteps = true;
+        public int adaptiveMediumSubsteps = 2;
+        public int adaptiveLowSubsteps = 1;
+        public float adaptiveHighQualityDuration = 1.2f;
+        public float adaptiveMediumDuration = 3.2f;
+        [Tooltip("If false, _XsphVelocityBlend is forced to 0 so the extra XSPH neighbour loop is skipped on GPU.")]
+        public bool enableXsphVelocityBlend = false;
+        [Tooltip("Run a full GPU particle compaction when too many already-solidified particles were deactivated and left as holes in the GPU buffer.")]
+        public bool compactInactiveGpuParticles = true;
+        [Range(0.05f, 0.95f)] public float gpuCompactInactiveRatio = 0.28f;
+        public int gpuCompactMinInactiveCount = 12000;
+        public int gpuCompactCooldownFrames = 45;
         [Tooltip("Rebuild the visible voxel mesh only once per N frames while particles are freezing. Higher values reduce lag during deposition.")]
         public int terrainMeshRebuildInterval = 1;
         [Tooltip("Voxel chunk side size used by the terrain renderer. 16 is a good default for this prototype.")]
@@ -249,6 +266,8 @@ namespace MeteoriteSPH3D
         private float lastImpactRadius = 4f;
         private bool hasImpact;
         private float simulationAccumulator;
+        private float timeSinceLastImpact = 999f;
+        private int gpuCompactCooldownRemaining;
 
         private void Awake()
         {
@@ -509,6 +528,8 @@ namespace MeteoriteSPH3D
             solidifyScanCursor = -1;
             readbackFrame = 0;
             simulationAccumulator = 0f;
+            timeSinceLastImpact = 999f;
+            gpuCompactCooldownRemaining = 0;
             pendingGpuDeactivateIndices.Clear();
             LastCreatedParticles = 0;
             LastSolidifiedParticles = 0;
@@ -629,7 +650,19 @@ namespace MeteoriteSPH3D
             forcedDepositSearchRadiusCells = 7;
             gpuReadbackInterval = 3;
             useAsyncGpuReadback = true;
+            useGpuDepositCandidateReadback = true;
+            gpuDepositCandidateCapacity = 8192;
             gpuTerrainUploadInterval = 1;
+            adaptiveSubsteps = true;
+            adaptiveMediumSubsteps = 2;
+            adaptiveLowSubsteps = 1;
+            adaptiveHighQualityDuration = 1.2f;
+            adaptiveMediumDuration = 3.2f;
+            enableXsphVelocityBlend = false;
+            compactInactiveGpuParticles = true;
+            gpuCompactInactiveRatio = 0.28f;
+            gpuCompactMinInactiveCount = 12000;
+            gpuCompactCooldownFrames = 45;
             terrainMeshRebuildInterval = 1;
             terrainChunkSize = 12;
             maxTerrainChunkRebuildsPerFrame = 24;
@@ -721,8 +754,11 @@ namespace MeteoriteSPH3D
             if (!paused)
             {
                 float dt = Mathf.Min(Time.deltaTime, 1f / 20f);
+                if (hasImpact) timeSinceLastImpact += dt;
+                if (gpuCompactCooldownRemaining > 0) gpuCompactCooldownRemaining--;
                 float fixedStep = Mathf.Max(0.001f, timeStep);
-                float step = fixedStep / Mathf.Max(1, substeps);
+                int runtimeSubsteps = GetRuntimeSubsteps();
+                float step = fixedStep / Mathf.Max(1, runtimeSubsteps);
                 simulationAccumulator = Mathf.Min(simulationAccumulator + dt, fixedStep * 4f);
                 int iterations = 0;
                 while (simulationAccumulator >= fixedStep && iterations < 4)
@@ -735,7 +771,7 @@ namespace MeteoriteSPH3D
                     float simStartMs = Time.realtimeSinceStartup * 1000f;
                     for (int i = 0; i < iterations; i++)
                     {
-                        for (int s = 0; s < Mathf.Max(1, substeps); s++)
+                        for (int s = 0; s < runtimeSubsteps; s++)
                         {
                             gpuSolver.Step(this, terrain, step);
                         }
@@ -745,18 +781,26 @@ namespace MeteoriteSPH3D
                     if (useAsyncGpuReadback && gpuSolver.SupportsAsyncReadback)
                     {
                         float readbackStartMs = Time.realtimeSinceStartup * 1000f;
-                        bool completed = gpuSolver.TryConsumeParticleReadback(particles);
+                        bool completed = useGpuDepositCandidateReadback
+                            ? gpuSolver.TryConsumeDepositCandidateReadback(particles)
+                            : gpuSolver.TryConsumeParticleReadback(particles);
                         if (completed)
                         {
                             LastGpuReadbackMs += Time.realtimeSinceStartup * 1000f - readbackStartMs;
-                            ProcessDownloadedGpuParticles(true);
+                            ProcessDownloadedGpuParticles(true, useGpuDepositCandidateReadback);
                         }
 
                         readbackFrame++;
-                        if (readbackFrame >= Mathf.Max(1, gpuReadbackInterval) && !gpuSolver.IsReadbackPending)
+                        bool pending = useGpuDepositCandidateReadback
+                            ? gpuSolver.IsDepositCandidateReadbackPending
+                            : gpuSolver.IsReadbackPending;
+                        if (readbackFrame >= Mathf.Max(1, gpuReadbackInterval) && !pending)
                         {
                             readbackFrame = 0;
-                            gpuSolver.RequestParticleReadback();
+                            if (useGpuDepositCandidateReadback)
+                                gpuSolver.RequestDepositCandidateReadback(this);
+                            else
+                                gpuSolver.RequestParticleReadback();
                         }
                     }
                     else
@@ -767,9 +811,12 @@ namespace MeteoriteSPH3D
                             readbackFrame = 0;
 
                             float readbackStartMs = Time.realtimeSinceStartup * 1000f;
-                            gpuSolver.DownloadToParticles(particles);
+                            if (useGpuDepositCandidateReadback)
+                                gpuSolver.DownloadDepositCandidates(this, particles);
+                            else
+                                gpuSolver.DownloadToParticles(particles);
                             LastGpuReadbackMs += Time.realtimeSinceStartup * 1000f - readbackStartMs;
-                            ProcessDownloadedGpuParticles(false);
+                            ProcessDownloadedGpuParticles(false, useGpuDepositCandidateReadback);
                         }
                     }
                 }
@@ -778,7 +825,7 @@ namespace MeteoriteSPH3D
                     float cpuSimStartMs = Time.realtimeSinceStartup * 1000f;
                     for (int i = 0; i < iterations; i++)
                     {
-                        for (int s = 0; s < Mathf.Max(1, substeps); s++)
+                        for (int s = 0; s < runtimeSubsteps; s++)
                         {
                             solver.Step(particles, terrain, this, step);
                         }
@@ -817,7 +864,7 @@ namespace MeteoriteSPH3D
         }
 
 
-        private void ProcessDownloadedGpuParticles(bool readbackWasAsync)
+        private void ProcessDownloadedGpuParticles(bool readbackWasAsync, bool partialCandidateReadback = false)
         {
             int before = particles.Count;
 
@@ -830,7 +877,7 @@ namespace MeteoriteSPH3D
             if (gpuTerrainDirty)
             {
                 gpuTerrainDirtyFrames++;
-                if (gpuTerrainDirtyFrames >= Mathf.Max(1, gpuTerrainUploadInterval))
+                if (gpuTerrainDirtyFrames >= GetEffectiveGpuTerrainUploadInterval())
                 {
                     gpuTerrainDirtyFrames = 0;
                     gpuTerrainDirty = false;
@@ -840,7 +887,7 @@ namespace MeteoriteSPH3D
                 }
             }
 
-            if (readbackWasAsync)
+            if (readbackWasAsync || partialCandidateReadback)
             {
                 if (pendingGpuDeactivateIndices.Count > 0)
                 {
@@ -854,8 +901,53 @@ namespace MeteoriteSPH3D
                 gpuSolver.UploadFromParticles(particles);
                 LastGpuParticleUploadMs += Time.realtimeSinceStartup * 1000f - uploadParticlesStartMs;
             }
+
+            TryCompactGpuParticles();
         }
 
+
+        private int GetRuntimeSubsteps()
+        {
+            int baseSubsteps = Mathf.Max(1, substeps);
+            if (!adaptiveSubsteps || !UseGpuSimulation) return baseSubsteps;
+
+            int medium = Mathf.Clamp(adaptiveMediumSubsteps, 1, baseSubsteps);
+            int low = Mathf.Clamp(adaptiveLowSubsteps, 1, medium);
+            int active = ActiveParticleCount;
+
+            if (!hasImpact || timeSinceLastImpact <= adaptiveHighQualityDuration) return baseSubsteps;
+            if (timeSinceLastImpact <= adaptiveMediumDuration) return medium;
+            if (active > 80000) return medium;
+            if (active > 20000) return medium;
+            return low;
+        }
+
+        private int GetEffectiveGpuTerrainUploadInterval()
+        {
+            int interval = Mathf.Max(1, gpuTerrainUploadInterval);
+            if (!UseGpuSimulation) return interval;
+
+            int active = ActiveParticleCount;
+            if (active > 120000) return Mathf.Max(interval, 6);
+            if (active > 60000) return Mathf.Max(interval, 4);
+            if (active > 15000) return Mathf.Max(interval, 3);
+            return interval;
+        }
+
+        private void TryCompactGpuParticles()
+        {
+            if (!UseGpuSimulation || !compactInactiveGpuParticles) return;
+            if (gpuCompactCooldownRemaining > 0) return;
+            if (gpuSolver.EstimatedInactiveCount < Mathf.Max(1, gpuCompactMinInactiveCount)) return;
+            if (gpuSolver.EstimatedInactiveRatio < Mathf.Clamp01(gpuCompactInactiveRatio)) return;
+            if (gpuSolver.IsReadbackPending || gpuSolver.IsDepositCandidateReadbackPending) return;
+
+            float compactStartMs = Time.realtimeSinceStartup * 1000f;
+            gpuSolver.CompactActiveParticles(particles);
+            LastGpuReadbackMs += Time.realtimeSinceStartup * 1000f - compactStartMs;
+            readbackFrame = 0;
+            gpuCompactCooldownRemaining = Mathf.Max(1, gpuCompactCooldownFrames);
+        }
 
         private void TryImpactFromMouse()
         {
@@ -992,6 +1084,8 @@ namespace MeteoriteSPH3D
             lastImpactCenter = center;
             lastImpactRadius = impactRadius;
             hasImpact = true;
+            timeSinceLastImpact = 0f;
+            gpuCompactCooldownRemaining = 0;
 
             int created = 0;
             Vector3Int min = terrain.WorldToCell(center - Vector3.one * impactRadius);

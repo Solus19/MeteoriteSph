@@ -3,6 +3,8 @@
 #pragma kernel DensityPressure
 #pragma kernel Integrate
 #pragma kernel DeactivateParticles
+#pragma kernel ClearDepositCandidates
+#pragma kernel CollectDepositCandidates
 
 struct Particle
 {
@@ -26,6 +28,21 @@ RWStructuredBuffer<int> _CellCounts;
 RWStructuredBuffer<int> _CellItems;
 StructuredBuffer<int> _DeactivateIndices;
 int _DeactivateCount;
+
+struct DepositCandidate
+{
+    float4 positionAge;
+    float4 velocityTemperature;
+    float4 contactMassIndexFlags;
+};
+
+RWStructuredBuffer<DepositCandidate> _DepositCandidates;
+RWStructuredBuffer<int> _DepositCandidateCounter;
+int _DepositCandidateCapacity;
+float _DepositMinAge;
+float _DepositMaxTemperature;
+float _DepositMaxSpeed;
+float _DepositForcedAge;
 
 int _ActiveCount;
 int3 _GridSize;
@@ -251,40 +268,43 @@ void Integrate(uint3 id : SV_DispatchThreadID)
 
     p.velocity += acc * dt;
 
-    // XSPH-like neighbour velocity blending. This is not collider contact; it is
-    // a fluid-style particle interaction that makes nearby particles drag each other.
-    float3 xsph = float3(0.0, 0.0, 0.0);
-    float xsphW = 0.0;
-    [loop]
-    for (int dz2 = -1; dz2 <= 1; dz2++)
-    [loop]
-    for (int dy2 = -1; dy2 <= 1; dy2++)
-    [loop]
-    for (int dx2 = -1; dx2 <= 1; dx2++)
+    // XSPH-like neighbour velocity blending. When blend is zero, skip the extra neighbour pass entirely.
+    float xsphBlend = saturate(_XsphVelocityBlend);
+    if (xsphBlend > 0.0001)
     {
-        int3 nc2 = baseCell + int3(dx2, dy2, dz2);
-        if (any(nc2 < int3(0,0,0)) || any(nc2 >= _GridSize)) continue;
-        int ci2 = CellIndex(nc2);
-        int count2 = min(_CellCounts[ci2], _MaxParticlesPerCell);
+        float3 xsph = float3(0.0, 0.0, 0.0);
+        float xsphW = 0.0;
         [loop]
-        for (int n2 = 0; n2 < count2; n2++)
+        for (int dz2 = -1; dz2 <= 1; dz2++)
+        [loop]
+        for (int dy2 = -1; dy2 <= 1; dy2++)
+        [loop]
+        for (int dx2 = -1; dx2 <= 1; dx2++)
         {
-            int qi2 = _CellItems[ci2 * _MaxParticlesPerCell + n2];
-            if (qi2 == (int)i) continue;
-            Particle q2 = _Particles[qi2];
-            if (q2.active < 0.5) continue;
-            float3 d2 = q2.position - p.position;
-            float rr2 = dot(d2, d2);
-            if (rr2 <= 0.0000001 || rr2 >= h * h) continue;
-            float rr = sqrt(rr2);
-            float w = saturate(1.0 - rr / h);
-            xsph += (q2.velocity - p.velocity) * w;
-            xsphW += w;
+            int3 nc2 = baseCell + int3(dx2, dy2, dz2);
+            if (any(nc2 < int3(0,0,0)) || any(nc2 >= _GridSize)) continue;
+            int ci2 = CellIndex(nc2);
+            int count2 = min(_CellCounts[ci2], _MaxParticlesPerCell);
+            [loop]
+            for (int n2 = 0; n2 < count2; n2++)
+            {
+                int qi2 = _CellItems[ci2 * _MaxParticlesPerCell + n2];
+                if (qi2 == (int)i) continue;
+                Particle q2 = _Particles[qi2];
+                if (q2.active < 0.5) continue;
+                float3 d2 = q2.position - p.position;
+                float rr2 = dot(d2, d2);
+                if (rr2 <= 0.0000001 || rr2 >= h * h) continue;
+                float rr = sqrt(rr2);
+                float w = saturate(1.0 - rr / h);
+                xsph += (q2.velocity - p.velocity) * w;
+                xsphW += w;
+            }
         }
-    }
-    if (xsphW > 0.0001)
-    {
-        p.velocity += (xsph / xsphW) * saturate(_XsphVelocityBlend) * saturate(dt * 8.0);
+        if (xsphW > 0.0001)
+        {
+            p.velocity += (xsph / xsphW) * xsphBlend * saturate(dt * 8.0);
+        }
     }
 
     float dampingBase = max(saturate(_Damping), 0.0001);
@@ -376,6 +396,51 @@ void Integrate(uint3 id : SV_DispatchThreadID)
     }
 
     _Particles[i] = p;
+}
+
+
+[numthreads(128, 1, 1)]
+void ClearDepositCandidates(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i == 0) _DepositCandidateCounter[0] = 0;
+    if (i >= (uint)_DepositCandidateCapacity) return;
+
+    DepositCandidate c;
+    c.positionAge = float4(0.0, 0.0, 0.0, 0.0);
+    c.velocityTemperature = float4(0.0, 0.0, 0.0, 0.0);
+    c.contactMassIndexFlags = float4(0.0, 0.0, -1.0, 0.0);
+    _DepositCandidates[i] = c;
+}
+
+[numthreads(128, 1, 1)]
+void CollectDepositCandidates(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_ActiveCount) return;
+
+    Particle p = _Particles[i];
+    if (p.active < 0.5) return;
+
+    float speed = length(p.velocity);
+
+    // Broad GPU-side filter only. Exact checks (rim/center/forced placement and
+    // FindDepositCell) stay on CPU, but CPU no longer reads every live particle.
+    bool coldEnough = p.temperature <= _DepositMaxTemperature;
+    bool oldEnough = p.age >= _DepositMinAge;
+    bool slowEnough = speed <= _DepositMaxSpeed;
+    bool touchedGroundOrForcedAge = p.recentGroundContact > 0.0 || p.age >= _DepositForcedAge;
+    if (!(coldEnough && oldEnough && slowEnough && touchedGroundOrForcedAge)) return;
+
+    int slot;
+    InterlockedAdd(_DepositCandidateCounter[0], 1, slot);
+    if (slot < 0 || slot >= _DepositCandidateCapacity) return;
+
+    DepositCandidate c;
+    c.positionAge = float4(p.position, p.age);
+    c.velocityTemperature = float4(p.velocity, p.temperature);
+    c.contactMassIndexFlags = float4(p.recentGroundContact, p.mass, (float)i, 1.0);
+    _DepositCandidates[slot] = c;
 }
 
 
