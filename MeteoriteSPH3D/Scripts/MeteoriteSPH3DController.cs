@@ -111,6 +111,18 @@ namespace MeteoriteSPH3D
         public bool activeUseHeightfieldMeshing = true;
         public bool activeUseBakedDirectionalTerrainShadows = false;
 
+        [Header("Deferred visual apply")]
+        [Tooltip("After click, run the particle/deposition algorithm invisibly and keep the old terrain mesh on screen. When all particles settle, apply all terrain changes with one final rebuild.")]
+        public bool deferVisualApplyUntilParticlesStop = true;
+        [Tooltip("Do not draw particles while deferred visual apply is active. The simulation still runs on GPU/CPU.")]
+        public bool hideParticlesDuringDeferredApply = true;
+        [Tooltip("During deferred visual apply, use GPU-side deposition for the whole run so CPU does not update visible terrain every few frames.")]
+        public bool forceGpuDirectDepositionDuringDeferredApply = true;
+        [Tooltip("When the hidden run finishes, rebuild all terrain chunks immediately in one final visible update.")]
+        public bool rebuildTerrainImmediatelyAfterDeferredApply = true;
+        [Tooltip("How many consecutive zero-active-particle frames must pass before committing the deferred terrain changes.")]
+        public int deferredApplyZeroParticleDelayFrames = 2;
+
         [Header("Impact")]
         public float impactRadius = 17.20f;
         public float impactPressure = 470f;
@@ -301,6 +313,8 @@ namespace MeteoriteSPH3D
         public int GpuParticleDrawCount { get { return UseGpuSimulation ? gpuSolver.ActiveCount : particles.Count; } }
         public int SolidVoxelCount { get { return terrain != null ? terrain.SolidCount : 0; } }
         public bool IsPaused { get { return paused; } }
+        public bool ShouldRenderParticles { get { return !(deferVisualApplyUntilParticlesStop && hideParticlesDuringDeferredApply && deferredVisualApplyActive); } }
+        public bool IsDeferredVisualApplyActive { get { return deferVisualApplyUntilParticlesStop && deferredVisualApplyActive; } }
 
         public float LastFrameMs { get; private set; }
         public float LastControllerUpdateMs { get; private set; }
@@ -319,6 +333,7 @@ namespace MeteoriteSPH3D
         private VoxelTerrain3D terrain;
         private readonly List<SPHParticle3D> particles = new List<SPHParticle3D>(8192);
         private readonly List<GPUSPH3DSolver.DepositedVoxel> gpuDepositedVoxels = new List<GPUSPH3DSolver.DepositedVoxel>(8192);
+        private readonly List<GPUSPH3DSolver.DepositedVoxel> deferredGpuDepositedVoxels = new List<GPUSPH3DSolver.DepositedVoxel>(32768);
         private readonly List<int> pendingGpuDeactivateIndices = new List<int>(512);
         private readonly SPHSolver3D solver = new SPHSolver3D();
         private readonly GPUSPH3DSolver gpuSolver = new GPUSPH3DSolver();
@@ -335,6 +350,8 @@ namespace MeteoriteSPH3D
         private int zeroActiveParticleShadowFrames;
         private bool terrainChunkShadowsCurrentlyEnabled;
         private bool finalVisualQualityCurrentlyEnabled;
+        private bool deferredVisualApplyActive;
+        private int deferredZeroActiveFrames;
 
         private VoxelMeshRenderer3D voxelRenderer;
         private ParticleRenderer3D particleRenderer;
@@ -642,8 +659,11 @@ namespace MeteoriteSPH3D
             gpuCompactCooldownRemaining = 0;
             pendingGpuDeactivateIndices.Clear();
             gpuDepositedVoxels.Clear();
+            deferredGpuDepositedVoxels.Clear();
             pendingDeposits.Clear();
             depositionBatchFramesElapsed = 0;
+            deferredVisualApplyActive = false;
+            deferredZeroActiveFrames = 0;
             lastImpactInitialParticleCount = 0;
             tailDepositionModeLatched = false;
             LastCreatedParticles = 0;
@@ -795,6 +815,11 @@ namespace MeteoriteSPH3D
             terrainChunkSize = 24;
             maxTerrainChunkRebuildsPerFrame = 6;
             terrainColliderUpdateInterval = 60;
+            deferVisualApplyUntilParticlesStop = true;
+            hideParticlesDuringDeferredApply = true;
+            forceGpuDirectDepositionDuringDeferredApply = true;
+            rebuildTerrainImmediatelyAfterDeferredApply = true;
+            deferredApplyZeroParticleDelayFrames = 2;
 
             rimCaptureEnabled = true;
             rimCaptureStartRadiusFactor = 0.58f;
@@ -917,11 +942,11 @@ namespace MeteoriteSPH3D
                             if (completed)
                             {
                                 LastGpuReadbackMs += Time.realtimeSinceStartup * 1000f - readbackStartMs;
-                                ProcessGpuDepositedVoxels();
+                                HandleGpuDepositedVoxels();
                             }
 
                             readbackFrame++;
-                            if (readbackFrame >= Mathf.Max(1, gpuReadbackInterval) && !gpuSolver.IsGpuDepositReadbackPending)
+                            if (ActiveParticleCount > 0 && readbackFrame >= Mathf.Max(1, gpuReadbackInterval) && !gpuSolver.IsGpuDepositReadbackPending)
                             {
                                 readbackFrame = 0;
                                 gpuSolver.RequestGpuDepositReadback(this);
@@ -930,13 +955,13 @@ namespace MeteoriteSPH3D
                         else
                         {
                             readbackFrame++;
-                            if (readbackFrame >= Mathf.Max(1, gpuReadbackInterval))
+                            if (ActiveParticleCount > 0 && readbackFrame >= Mathf.Max(1, gpuReadbackInterval))
                             {
                                 readbackFrame = 0;
                                 float readbackStartMs = Time.realtimeSinceStartup * 1000f;
                                 gpuSolver.DownloadGpuDeposits(this, gpuDepositedVoxels);
                                 LastGpuReadbackMs += Time.realtimeSinceStartup * 1000f - readbackStartMs;
-                                ProcessGpuDepositedVoxels();
+                                HandleGpuDepositedVoxels();
                             }
                         }
                     }
@@ -1008,7 +1033,9 @@ namespace MeteoriteSPH3D
                 UploadDirtyTerrainIfDue();
             }
 
-            if (terrainDirty && voxelRenderer != null)
+            TryCommitDeferredVisualApplyIfFinished();
+
+            if (terrainDirty && voxelRenderer != null && !IsDeferredVisualApplyActive)
             {
                 terrainMeshDirtyFrames++;
                 int meshInterval = GetEffectiveTerrainMeshRebuildInterval();
@@ -1039,7 +1066,7 @@ namespace MeteoriteSPH3D
         {
             if (voxelRenderer == null) return;
 
-            bool particlesActive = ActiveParticleCount > 0;
+            bool particlesActive = ActiveParticleCount > 0 || IsDeferredVisualApplyActive;
             if (particlesActive)
             {
                 zeroActiveParticleShadowFrames = 0;
@@ -1069,8 +1096,35 @@ namespace MeteoriteSPH3D
 
         private bool UseDirectGpuDepositionThisFrame()
         {
-            if (!UseGpuSimulation || !useGpuDirectDeposition) return false;
+            if (!UseGpuSimulation) return false;
+            if (IsDeferredVisualApplyActive && forceGpuDirectDepositionDuringDeferredApply) return true;
+            if (!useGpuDirectDeposition) return false;
             return !gpuDirectDepositionOnlyInTail || IsTailDepositModeActive();
+        }
+
+        private void HandleGpuDepositedVoxels()
+        {
+            if (IsDeferredVisualApplyActive)
+            {
+                AccumulateDeferredGpuDeposits();
+            }
+            else
+            {
+                ProcessGpuDepositedVoxels();
+            }
+        }
+
+        private void AccumulateDeferredGpuDeposits()
+        {
+            if (gpuDepositedVoxels.Count == 0) return;
+
+            float startMs = Time.realtimeSinceStartup * 1000f;
+            for (int i = 0; i < gpuDepositedVoxels.Count; i++)
+            {
+                deferredGpuDepositedVoxels.Add(gpuDepositedVoxels[i]);
+            }
+            gpuDepositedVoxels.Clear();
+            LastSolidifyMs += Time.realtimeSinceStartup * 1000f - startMs;
         }
 
 
@@ -1114,6 +1168,86 @@ namespace MeteoriteSPH3D
 
             LastSolidifyMs += Time.realtimeSinceStartup * 1000f - startMs;
             TryCompactGpuParticles();
+        }
+
+        private void TryCommitDeferredVisualApplyIfFinished()
+        {
+            if (!IsDeferredVisualApplyActive) return;
+
+            if (ActiveParticleCount > 0 || gpuSolver.IsGpuDepositReadbackPending || gpuSolver.IsDepositCandidateReadbackPending || gpuSolver.IsReadbackPending)
+            {
+                deferredZeroActiveFrames = 0;
+                return;
+            }
+
+            deferredZeroActiveFrames++;
+            if (deferredZeroActiveFrames < Mathf.Max(0, deferredApplyZeroParticleDelayFrames)) return;
+
+            CommitDeferredVisualApply();
+        }
+
+        private void CommitDeferredVisualApply()
+        {
+            if (!deferredVisualApplyActive) return;
+
+            float startMs = Time.realtimeSinceStartup * 1000f;
+
+            FlushPendingDeposits(true);
+
+            int placed = 0;
+            for (int i = 0; i < deferredGpuDepositedVoxels.Count; i++)
+            {
+                GPUSPH3DSolver.DepositedVoxel d = deferredGpuDepositedVoxels[i];
+                if (terrain == null || !terrain.InBounds(d.x, d.y, d.z)) continue;
+                if (terrain.IsSolid(d.x, d.y, d.z)) continue;
+
+                float temp = Mathf.Max(1f, Mathf.Min(d.temperature, sculptRimTemperature));
+                terrain.SetSolid(d.x, d.y, d.z, true, temp, 0f, 0.1f, true);
+                placed++;
+            }
+
+            deferredGpuDepositedVoxels.Clear();
+
+            if (placed > 0)
+            {
+                LastSolidifiedParticles += placed;
+                TotalSolidifiedParticles += placed;
+            }
+
+            particles.Clear();
+            pendingGpuDeactivateIndices.Clear();
+            gpuDepositedVoxels.Clear();
+            if (UseGpuSimulation && gpuSolver.IsReady)
+            {
+                gpuSolver.UploadFromParticles(particles);
+            }
+
+            deferredVisualApplyActive = false;
+            deferredZeroActiveFrames = 0;
+            tailDepositionModeLatched = false;
+            solidifyScanCursor = -1;
+
+            if (terrain != null) terrain.MarkAllDirty();
+            terrainDirty = true;
+            terrainMeshDirtyFrames = GetEffectiveTerrainMeshRebuildInterval();
+
+            ApplyLightingQuality(true, true);
+            if (voxelRenderer != null)
+            {
+                terrainChunkShadowsCurrentlyEnabled = enableTerrainShadowsWhenParticlesStop;
+                voxelRenderer.SetRealtimeChunkShadows(enableTerrainShadowsWhenParticlesStop);
+                ApplyTerrainRenderQuality(true, false);
+                if (rebuildTerrainImmediatelyAfterDeferredApply)
+                {
+                    float meshStartMs = Time.realtimeSinceStartup * 1000f;
+                    voxelRenderer.RebuildImmediate(terrain);
+                    LastMeshRebuildMs += Time.realtimeSinceStartup * 1000f - meshStartMs;
+                    terrainDirty = false;
+                    terrainMeshDirtyFrames = 0;
+                }
+            }
+
+            LastSolidifyMs += Time.realtimeSinceStartup * 1000f - startMs;
         }
 
 
@@ -1265,6 +1399,7 @@ namespace MeteoriteSPH3D
 
         private void TryCompactGpuParticles()
         {
+            if (IsDeferredVisualApplyActive) return;
             if (!UseGpuSimulation || !compactInactiveGpuParticles) return;
             if (gpuCompactCooldownRemaining > 0) return;
 
@@ -1291,6 +1426,7 @@ namespace MeteoriteSPH3D
         private void TryImpactFromMouse()
         {
             if (mainCamera == null) return;
+            if (IsDeferredVisualApplyActive) return;
             Ray ray = mainCamera.ScreenPointToRay(InputBridge3D.MousePosition());
 
             Vector3 voxelHit;
@@ -1404,6 +1540,9 @@ namespace MeteoriteSPH3D
         private void ApplyImpact(Vector3 hitPoint)
         {
             FlushPendingDeposits(true);
+            deferredGpuDepositedVoxels.Clear();
+            deferredVisualApplyActive = false;
+            deferredZeroActiveFrames = 0;
 
             // New impact appends particles on CPU. Sync once on click so we do not overwrite
             // the current GPU simulation with an older async readback snapshot.
@@ -1489,6 +1628,11 @@ namespace MeteoriteSPH3D
             TotalCreatedParticles += created;
             lastImpactInitialParticleCount = Mathf.Max(1, created);
             tailDepositionModeLatched = false;
+            if (deferVisualApplyUntilParticlesStop && created > 0)
+            {
+                deferredVisualApplyActive = true;
+                deferredZeroActiveFrames = 0;
+            }
 
             terrainDirty = true;
             terrainMeshDirtyFrames = terrainMeshRebuildInterval;
