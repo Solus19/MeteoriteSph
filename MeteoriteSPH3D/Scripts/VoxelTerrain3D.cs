@@ -18,12 +18,16 @@ namespace MeteoriteSPH3D
         public int SolidCount { get; private set; }
         public bool HasDirtyBounds { get { return dirtyBoundsValid; } }
         public bool HasDirtyVoxels { get { return dirtyVoxelIndices.Count > 0; } }
+        public bool HasGpuDirtyVoxels { get { return gpuAllDirty || gpuDirtyVoxelIndices.Count > 0; } }
 
         private readonly List<int> thermalIndices = new List<int>(4096);
         private readonly bool[] thermalQueued;
         private readonly int[] topSolidYByColumn;
         private readonly List<int> dirtyVoxelIndices = new List<int>(4096);
         private readonly bool[] dirtyVoxelQueued;
+        private readonly List<int> gpuDirtyVoxelIndices = new List<int>(4096);
+        private readonly bool[] gpuDirtyVoxelQueued;
+        private bool gpuAllDirty;
 
         private bool dirtyBoundsValid;
         private int dirtyMinX;
@@ -43,6 +47,7 @@ namespace MeteoriteSPH3D
             thermalQueued = new bool[Cells.Length];
             topSolidYByColumn = new int[Width * Depth];
             dirtyVoxelQueued = new bool[Cells.Length];
+            gpuDirtyVoxelQueued = new bool[Cells.Length];
             for (int i = 0; i < topSolidYByColumn.Length; i++) topSolidYByColumn[i] = -1;
         }
 
@@ -344,11 +349,19 @@ namespace MeteoriteSPH3D
                 dirtyVoxelQueued[index] = true;
                 dirtyVoxelIndices.Add(index);
             }
+
+            if (!gpuAllDirty && !gpuDirtyVoxelQueued[index])
+            {
+                gpuDirtyVoxelQueued[index] = true;
+                gpuDirtyVoxelIndices.Add(index);
+            }
         }
 
         public void MarkAllDirty()
         {
             ClearDirtyVoxelQueue();
+            ClearGpuDirtyVoxelQueue();
+            gpuAllDirty = true;
             dirtyBoundsValid = true;
             dirtyMinX = 0;
             dirtyMinY = 0;
@@ -375,6 +388,38 @@ namespace MeteoriteSPH3D
             return target.Count > 0;
         }
 
+        public bool ConsumeGpuDirtyVoxelIndices(List<int> target, out bool fullUploadRequired)
+        {
+            fullUploadRequired = false;
+            if (target == null) return false;
+            target.Clear();
+
+            if (gpuAllDirty)
+            {
+                fullUploadRequired = true;
+                gpuAllDirty = false;
+                ClearGpuDirtyVoxelQueue();
+                return false;
+            }
+
+            if (gpuDirtyVoxelIndices.Count == 0) return false;
+
+            for (int i = 0; i < gpuDirtyVoxelIndices.Count; i++)
+            {
+                int index = gpuDirtyVoxelIndices[i];
+                target.Add(index);
+                gpuDirtyVoxelQueued[index] = false;
+            }
+            gpuDirtyVoxelIndices.Clear();
+            return target.Count > 0;
+        }
+
+        public void ClearGpuDirtyVoxels()
+        {
+            gpuAllDirty = false;
+            ClearGpuDirtyVoxelQueue();
+        }
+
         private void ClearDirtyVoxelQueue()
         {
             for (int i = 0; i < dirtyVoxelIndices.Count; i++)
@@ -382,6 +427,15 @@ namespace MeteoriteSPH3D
                 dirtyVoxelQueued[dirtyVoxelIndices[i]] = false;
             }
             dirtyVoxelIndices.Clear();
+        }
+
+        private void ClearGpuDirtyVoxelQueue()
+        {
+            for (int i = 0; i < gpuDirtyVoxelIndices.Count; i++)
+            {
+                gpuDirtyVoxelQueued[gpuDirtyVoxelIndices[i]] = false;
+            }
+            gpuDirtyVoxelIndices.Clear();
         }
 
         public bool ConsumeDirtyBounds(out int minX, out int minY, out int minZ, out int maxX, out int maxY, out int maxZ)
@@ -446,6 +500,8 @@ namespace MeteoriteSPH3D
             System.Array.Clear(thermalQueued, 0, thermalQueued.Length);
             dirtyBoundsValid = false;
             ClearDirtyVoxelQueue();
+            ClearGpuDirtyVoxelQueue();
+            gpuAllDirty = false;
         }
     }
 }

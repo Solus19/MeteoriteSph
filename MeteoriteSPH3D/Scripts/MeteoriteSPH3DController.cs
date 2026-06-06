@@ -10,6 +10,24 @@ namespace MeteoriteSPH3D
 
         public static MeteoriteSPH3DController Instance { get; private set; }
 
+        private struct PendingDeposit
+        {
+            public Vector3Int cell;
+            public float temperature;
+            public bool rim;
+            public bool center;
+            public bool forced;
+
+            public PendingDeposit(Vector3Int cell, float temperature, bool rim, bool center, bool forced)
+            {
+                this.cell = cell;
+                this.temperature = temperature;
+                this.rim = rim;
+                this.center = center;
+                this.forced = forced;
+            }
+        }
+
         [Header("Voxel terrain")]
         public int terrainWidth = 240;
         public int terrainHeight = 128;
@@ -23,7 +41,7 @@ namespace MeteoriteSPH3D
 
         [Header("GPU simulation")]
         public bool useGpuSimulation = true;
-        public int gpuGridMaxParticlesPerCell = 160;
+        public int gpuGridMaxParticlesPerCell = 96;
         public int gpuReadbackInterval = 3;
         [Tooltip("Use AsyncGPUReadback for particle state transfer. This avoids blocking the render thread while GPU particles are copied back for deposition.")]
         public bool useAsyncGpuReadback = true;
@@ -32,13 +50,15 @@ namespace MeteoriteSPH3D
         [Tooltip("Maximum number of potential deposit particles copied from GPU to CPU per readback. Increase if very large impacts stop depositing material fast enough.")]
         public int gpuDepositCandidateCapacity = 8192;
         [Tooltip("Upload modified voxel terrain back to the GPU only once per N solidification batches. Higher values reduce lag while particles are freezing.")]
-        public int gpuTerrainUploadInterval = 1;
+        public int gpuTerrainUploadInterval = 4;
         [Tooltip("After a fresh impact keep the original substep count for a short burst, then drop to cheaper substeps as the ejecta slows down.")]
         public bool adaptiveSubsteps = true;
-        public int adaptiveMediumSubsteps = 2;
+        public int adaptiveMediumSubsteps = 1;
         public int adaptiveLowSubsteps = 1;
-        public float adaptiveHighQualityDuration = 1.2f;
-        public float adaptiveMediumDuration = 3.2f;
+        public float adaptiveHighQualityDuration = 0.4f;
+        public float adaptiveMediumDuration = 1.5f;
+        [Tooltip("Hard cap for fixed simulation iterations in one rendered frame. Lower values avoid FPS collapse when Unity falls behind.")]
+        public int maxGpuSimulationIterationsPerFrame = 2;
         [Tooltip("If false, _XsphVelocityBlend is forced to 0 so the extra XSPH neighbour loop is skipped on GPU.")]
         public bool enableXsphVelocityBlend = false;
         [Tooltip("Run a full GPU particle compaction when too many already-solidified particles were deactivated and left as holes in the GPU buffer.")]
@@ -114,7 +134,7 @@ namespace MeteoriteSPH3D
         public float maxVelocity = 170.0f;
         public float maxAcceleration = 18000.0f;
         public float timeStep = 1f / 90f;
-        public int substeps = 5;
+        public int substeps = 2;
         public float coolingRate = 2.2f;
         public float groundCoolingRate = 60f;
         public float extraWorldHeight = 20f;
@@ -154,6 +174,21 @@ namespace MeteoriteSPH3D
         public int maxSolidifyPerFrame = 4096;
         [Tooltip("Maximum number of particles checked for solidification in one frame. Prevents full-list scans when many particles exist.")]
         public int maxSolidifyChecksPerFrame = 50000;
+
+        [Header("Tail deposition optimization")]
+        [Tooltip("Queue particle deposits for a few frames, then write them to the voxel terrain in one batch. This reduces repeated dirty chunk rebuilds while particles freeze.")]
+        public bool useBatchedParticleDeposition = true;
+        [Tooltip("How many frames deposits can be accumulated before they are written to the voxel terrain.")]
+        public int depositionBatchFrames = 4;
+        [Tooltip("Flush the deposit queue immediately when it reaches this size, even if depositionBatchFrames has not elapsed.")]
+        public int depositionBatchMaxQueued = 2048;
+        [Tooltip("When active particles drop below this fraction of particles created by the last impact, remaining deposit candidates are forced to settle instead of simulating a long tail.")]
+        public bool forceDepositTailUnderInitialFraction = true;
+        [Range(0.001f, 0.10f)] public float tailForceDepositInitialFraction = 0.01f;
+        [Tooltip("Visible terrain mesh rebuild interval used after the tail cleanup mode starts.")]
+        public int tailMeshRebuildInterval = 8;
+        [Tooltip("Chunk rebuild budget used after the tail cleanup mode starts.")]
+        public int tailMaxTerrainChunkRebuildsPerFrame = 6;
 
         [Header("Particle cleanup")]
         [Tooltip("Force old, cold ejecta that is already lying near the surface to settle into voxels. This prevents a permanent carpet of particles around the crater.")]
@@ -253,6 +288,10 @@ namespace MeteoriteSPH3D
         private int solidifyScanCursor = -1;
         private int terrainMeshDirtyFrames;
         private int gpuTerrainDirtyFrames;
+        private readonly List<PendingDeposit> pendingDeposits = new List<PendingDeposit>(2048);
+        private int depositionBatchFramesElapsed;
+        private int lastImpactInitialParticleCount;
+        private bool tailDepositionModeLatched;
         private bool gpuTerrainDirty;
         private bool lastGpuMode;
 
@@ -531,6 +570,10 @@ namespace MeteoriteSPH3D
             timeSinceLastImpact = 999f;
             gpuCompactCooldownRemaining = 0;
             pendingGpuDeactivateIndices.Clear();
+            pendingDeposits.Clear();
+            depositionBatchFramesElapsed = 0;
+            lastImpactInitialParticleCount = 0;
+            tailDepositionModeLatched = false;
             LastCreatedParticles = 0;
             LastSolidifiedParticles = 0;
             TotalCreatedParticles = 0;
@@ -588,7 +631,7 @@ namespace MeteoriteSPH3D
             impactActivateAllVoxelsInside = false;
             maxParticles = 500000;
             maxCreatedParticlesPerImpact = 320000;
-            gpuGridMaxParticlesPerCell = 160;
+            gpuGridMaxParticlesPerCell = 96;
 
             smoothingRadius = 0.95f;
             particleRadius = 0.16f;
@@ -615,7 +658,7 @@ namespace MeteoriteSPH3D
             maxVelocity = 170.0f;
             maxAcceleration = 18000.0f;
             timeStep = 1f / 90f;
-            substeps = 5;
+            substeps = 2;
             coolingRate = 2.2f;
             groundCoolingRate = 60.0f;
 
@@ -642,6 +685,13 @@ namespace MeteoriteSPH3D
             antiPillarProminencePenalty = 7.5f;
             maxSolidifyPerFrame = 4096;
             maxSolidifyChecksPerFrame = 50000;
+            useBatchedParticleDeposition = true;
+            depositionBatchFrames = 4;
+            depositionBatchMaxQueued = 2048;
+            forceDepositTailUnderInitialFraction = true;
+            tailForceDepositInitialFraction = 0.01f;
+            tailMeshRebuildInterval = 8;
+            tailMaxTerrainChunkRebuildsPerFrame = 6;
             forceDepositOldParticles = true;
             forceDepositAge = 5.2f;
             forceDepositMaxSpeed = 8.5f;
@@ -652,12 +702,13 @@ namespace MeteoriteSPH3D
             useAsyncGpuReadback = true;
             useGpuDepositCandidateReadback = true;
             gpuDepositCandidateCapacity = 8192;
-            gpuTerrainUploadInterval = 1;
+            gpuTerrainUploadInterval = 4;
             adaptiveSubsteps = true;
-            adaptiveMediumSubsteps = 2;
+            adaptiveMediumSubsteps = 1;
             adaptiveLowSubsteps = 1;
-            adaptiveHighQualityDuration = 1.2f;
-            adaptiveMediumDuration = 3.2f;
+            adaptiveHighQualityDuration = 0.4f;
+            adaptiveMediumDuration = 1.5f;
+            maxGpuSimulationIterationsPerFrame = 2;
             enableXsphVelocityBlend = false;
             compactInactiveGpuParticles = true;
             gpuCompactInactiveRatio = 0.28f;
@@ -759,9 +810,10 @@ namespace MeteoriteSPH3D
                 float fixedStep = Mathf.Max(0.001f, timeStep);
                 int runtimeSubsteps = GetRuntimeSubsteps();
                 float step = fixedStep / Mathf.Max(1, runtimeSubsteps);
-                simulationAccumulator = Mathf.Min(simulationAccumulator + dt, fixedStep * 4f);
+                int maxIterationsThisFrame = UseGpuSimulation ? Mathf.Clamp(maxGpuSimulationIterationsPerFrame, 1, 4) : 4;
+                simulationAccumulator = Mathf.Min(simulationAccumulator + dt, fixedStep * maxIterationsThisFrame);
                 int iterations = 0;
-                while (simulationAccumulator >= fixedStep && iterations < 4)
+                while (simulationAccumulator >= fixedStep && iterations < maxIterationsThisFrame)
                 {
                     simulationAccumulator -= fixedStep;
                     iterations++;
@@ -839,19 +891,22 @@ namespace MeteoriteSPH3D
                 }
 
                 terrain.CoolVoxels(Time.deltaTime, coolingRate * 0.2f);
+                FlushPendingDepositsIfNeeded(false);
+                UploadDirtyTerrainIfDue();
             }
 
             if (terrainDirty && voxelRenderer != null)
             {
                 terrainMeshDirtyFrames++;
-                if (terrainMeshDirtyFrames >= Mathf.Max(1, terrainMeshRebuildInterval))
+                int meshInterval = GetEffectiveTerrainMeshRebuildInterval();
+                if (terrainMeshDirtyFrames >= meshInterval)
                 {
-                    voxelRenderer.Configure(terrainChunkSize, maxTerrainChunkRebuildsPerFrame, terrainColliderUpdateInterval);
+                    voxelRenderer.Configure(terrainChunkSize, GetEffectiveMaxTerrainChunkRebuildsPerFrame(), terrainColliderUpdateInterval);
                     float meshStartMs = Time.realtimeSinceStartup * 1000f;
                     voxelRenderer.Rebuild(terrain);
                     LastMeshRebuildMs += Time.realtimeSinceStartup * 1000f - meshStartMs;
                     terrainDirty = voxelRenderer.HasPendingRebuilds || (terrain != null && (terrain.HasDirtyBounds || terrain.HasDirtyVoxels));
-                    terrainMeshDirtyFrames = terrainDirty ? terrainMeshRebuildInterval : 0;
+                    terrainMeshDirtyFrames = terrainDirty && !IsTailDepositModeActive() ? meshInterval : 0;
                 }
             }
 
@@ -874,18 +929,7 @@ namespace MeteoriteSPH3D
             LastSolidifiedParticles += solidified;
             TotalSolidifiedParticles += solidified;
 
-            if (gpuTerrainDirty)
-            {
-                gpuTerrainDirtyFrames++;
-                if (gpuTerrainDirtyFrames >= GetEffectiveGpuTerrainUploadInterval())
-                {
-                    gpuTerrainDirtyFrames = 0;
-                    gpuTerrainDirty = false;
-                    float uploadTerrainStartMs = Time.realtimeSinceStartup * 1000f;
-                    gpuSolver.UploadTerrain(terrain);
-                    LastGpuTerrainUploadMs += Time.realtimeSinceStartup * 1000f - uploadTerrainStartMs;
-                }
-            }
+            UploadDirtyTerrainIfDue();
 
             if (readbackWasAsync || partialCandidateReadback)
             {
@@ -905,6 +949,93 @@ namespace MeteoriteSPH3D
             TryCompactGpuParticles();
         }
 
+
+        public bool IsTailDepositModeActive()
+        {
+            if (tailDepositionModeLatched) return true;
+            if (!hasImpact || !forceDepositTailUnderInitialFraction || lastImpactInitialParticleCount <= 0) return false;
+
+            int active = ActiveParticleCount;
+            int threshold = Mathf.Max(1, Mathf.CeilToInt(lastImpactInitialParticleCount * Mathf.Clamp(tailForceDepositInitialFraction, 0.001f, 0.10f)));
+            if (active > 0 && active <= threshold)
+            {
+                tailDepositionModeLatched = true;
+                return true;
+            }
+
+            return false;
+        }
+
+        private int GetEffectiveTerrainMeshRebuildInterval()
+        {
+            return Mathf.Max(1, IsTailDepositModeActive() ? tailMeshRebuildInterval : terrainMeshRebuildInterval);
+        }
+
+        private int GetEffectiveMaxTerrainChunkRebuildsPerFrame()
+        {
+            return Mathf.Max(1, IsTailDepositModeActive() ? tailMaxTerrainChunkRebuildsPerFrame : maxTerrainChunkRebuildsPerFrame);
+        }
+
+        private void QueuePendingDeposit(Vector3Int cell, float temperature, bool rim, bool center, bool forced)
+        {
+            pendingDeposits.Add(new PendingDeposit(cell, temperature, rim, center, forced));
+            if (pendingDeposits.Count >= Mathf.Max(1, depositionBatchMaxQueued))
+            {
+                FlushPendingDeposits(true);
+            }
+        }
+
+        private void FlushPendingDepositsIfNeeded(bool force)
+        {
+            if (pendingDeposits.Count == 0)
+            {
+                depositionBatchFramesElapsed = 0;
+                return;
+            }
+
+            depositionBatchFramesElapsed++;
+            int frames = Mathf.Max(1, depositionBatchFrames);
+            if (force || depositionBatchFramesElapsed >= frames)
+            {
+                FlushPendingDeposits(true);
+            }
+        }
+
+        private void FlushPendingDeposits(bool force)
+        {
+            if (pendingDeposits.Count == 0 || terrain == null) return;
+
+            int placed = 0;
+            for (int i = 0; i < pendingDeposits.Count; i++)
+            {
+                PendingDeposit d = pendingDeposits[i];
+                placed += DepositParticleMaterial(d.cell, d.temperature, d.rim, d.center, d.forced);
+            }
+
+            pendingDeposits.Clear();
+            depositionBatchFramesElapsed = 0;
+
+            if (placed > 0)
+            {
+                terrainDirty = true;
+                gpuTerrainDirty = true;
+            }
+        }
+
+        private void UploadDirtyTerrainIfDue()
+        {
+            if (!UseGpuSimulation || !gpuTerrainDirty || gpuSolver == null || !gpuSolver.IsReady) return;
+
+            gpuTerrainDirtyFrames++;
+            if (gpuTerrainDirtyFrames >= GetEffectiveGpuTerrainUploadInterval())
+            {
+                gpuTerrainDirtyFrames = 0;
+                gpuTerrainDirty = false;
+                float uploadTerrainStartMs = Time.realtimeSinceStartup * 1000f;
+                gpuSolver.UploadDirtyTerrain(terrain);
+                LastGpuTerrainUploadMs += Time.realtimeSinceStartup * 1000f - uploadTerrainStartMs;
+            }
+        }
 
         private int GetRuntimeSubsteps()
         {
@@ -1064,6 +1195,8 @@ namespace MeteoriteSPH3D
 
         private void ApplyImpact(Vector3 hitPoint)
         {
+            FlushPendingDeposits(true);
+
             // New impact appends particles on CPU. Sync once on click so we do not overwrite
             // the current GPU simulation with an older async readback snapshot.
             if (UseGpuSimulation && gpuSolver.ActiveCount > 0)
@@ -1145,13 +1278,15 @@ namespace MeteoriteSPH3D
 
             LastCreatedParticles = created;
             TotalCreatedParticles += created;
+            lastImpactInitialParticleCount = Mathf.Max(1, created);
+            tailDepositionModeLatched = false;
 
             terrainDirty = true;
             terrainMeshDirtyFrames = terrainMeshRebuildInterval;
             if (useGpuSimulation && gpuSolver.IsReady)
             {
                 float uploadTerrainStartMs = Time.realtimeSinceStartup * 1000f;
-                gpuSolver.UploadTerrain(terrain);
+                gpuSolver.UploadDirtyTerrain(terrain);
                 LastGpuTerrainUploadMs += Time.realtimeSinceStartup * 1000f - uploadTerrainStartMs;
                 gpuTerrainDirty = false;
                 gpuTerrainDirtyFrames = 0;
@@ -1277,6 +1412,8 @@ namespace MeteoriteSPH3D
             int checkedParticles = 0;
             int maxChecks = Mathf.Max(64, maxSolidifyChecksPerFrame);
             int maxSolidify = Mathf.Max(1, maxSolidifyPerFrame);
+            bool tailForcedDeposit = IsTailDepositModeActive();
+            bool batchDeposits = useBatchedParticleDeposition && Mathf.Max(1, depositionBatchFrames) > 1;
 
             if (particles.Count == 0)
             {
@@ -1307,24 +1444,35 @@ namespace MeteoriteSPH3D
                 bool normal = p.age >= solidifyMinAge && p.temperature <= solidifyTemperature && speed <= solidifySpeed && p.recentGroundContact > 0f;
                 bool center = IsCenterCaptureAllowed(p, speed);
                 bool rim = IsRimCaptureAllowed(p, speed);
-                bool forced = IsForcedDepositAllowed(p, speed);
+                bool forced = tailForcedDeposit || IsForcedDepositAllowed(p, speed);
 
                 if (normal || center || rim || forced)
                 {
                     Vector3Int deposit;
                     if (FindDepositCell(p.position, rim, center, forced, out deposit))
                     {
-                        int placedVoxels = DepositParticleMaterial(deposit, Mathf.Min(p.temperature, sculptRimTemperature), rim, center, forced);
+                        int placedVoxels;
+                        float depositTemperature = Mathf.Min(p.temperature, sculptRimTemperature);
+                        if (batchDeposits)
+                        {
+                            QueuePendingDeposit(deposit, depositTemperature, rim, center, forced);
+                            placedVoxels = 1;
+                        }
+                        else
+                        {
+                            placedVoxels = DepositParticleMaterial(deposit, depositTemperature, rim, center, forced);
+                            if (placedVoxels > 0)
+                            {
+                                terrainDirty = true;
+                                gpuTerrainDirty = true;
+                            }
+                        }
+
                         if (!removeParticleOnlyAfterVisibleVoxelDeposit || placedVoxels > 0)
                         {
                             if (UseGpuSimulation && p.gpuIndex >= 0) pendingGpuDeactivateIndices.Add(p.gpuIndex);
                             RemoveParticleAtSwap(i);
                             solidified++;
-                            terrainDirty = true;
-                            gpuTerrainDirty = true;
-                            // Do not wait several frames/chunks after cleanup: make voxel deposition visible immediately.
-                            terrainMeshDirtyFrames = terrainMeshRebuildInterval;
-                            gpuTerrainDirtyFrames = gpuTerrainUploadInterval;
                             i--;
                             continue;
                         }

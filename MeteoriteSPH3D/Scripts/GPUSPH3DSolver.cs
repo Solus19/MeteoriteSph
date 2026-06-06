@@ -54,6 +54,8 @@ namespace MeteoriteSPH3D
         private GPUParticle[] particleCache;
         private DepositCandidate[] depositCandidateCache;
         private int[] terrainSolidCache;
+        private int[] terrainDirtyUploadIndices;
+        private readonly List<int> terrainDirtyScratch = new List<int>(4096);
         private int[] deactivateIndexCache;
 
         private bool readbackPending;
@@ -166,6 +168,8 @@ namespace MeteoriteSPH3D
             particleCache = null;
             depositCandidateCache = null;
             terrainSolidCache = null;
+            terrainDirtyUploadIndices = null;
+            terrainDirtyScratch.Clear();
             deactivateIndexCache = null;
             readbackPending = false;
             depositCandidateReadbackPending = false;
@@ -189,9 +193,11 @@ namespace MeteoriteSPH3D
         {
             if (terrainSolidBuffer == null || terrain == null) return;
             int n = terrain.Width * terrain.Height * terrain.Depth;
-            if (terrainSolidCache == null || terrainSolidCache.Length != n) terrainSolidCache = new int[n];
+            EnsureTerrainUploadCache(n);
 
             int i = 0;
+            // Keep this order identical to TerrainIndex() in the compute shader:
+            // x + y * width + z * width * height.
             for (int z = 0; z < terrain.Depth; z++)
             {
                 for (int y = 0; y < terrain.Height; y++)
@@ -203,6 +209,90 @@ namespace MeteoriteSPH3D
                 }
             }
             terrainSolidBuffer.SetData(terrainSolidCache);
+            terrain.ClearGpuDirtyVoxels();
+        }
+
+        public void UploadDirtyTerrain(VoxelTerrain3D terrain)
+        {
+            if (terrainSolidBuffer == null || terrain == null) return;
+
+            int n = terrain.Width * terrain.Height * terrain.Depth;
+            EnsureTerrainUploadCache(n);
+
+            bool fullUploadRequired;
+            bool hasDirty = terrain.ConsumeGpuDirtyVoxelIndices(terrainDirtyScratch, out fullUploadRequired);
+            if (fullUploadRequired || terrainSolidCache == null)
+            {
+                UploadTerrain(terrain);
+                return;
+            }
+
+            if (!hasDirty || terrainDirtyScratch.Count == 0) return;
+
+            // If too much of the terrain changed, one full upload is cheaper than thousands of tiny SetData calls.
+            if (terrainDirtyScratch.Count > Mathf.Max(4096, n / 6))
+            {
+                UploadTerrain(terrain);
+                return;
+            }
+
+            if (terrainDirtyUploadIndices == null || terrainDirtyUploadIndices.Length < terrainDirtyScratch.Count)
+                terrainDirtyUploadIndices = new int[Mathf.NextPowerOfTwo(terrainDirtyScratch.Count)];
+
+            int count = 0;
+            for (int i = 0; i < terrainDirtyScratch.Count; i++)
+            {
+                int terrainIndex = terrainDirtyScratch[i];
+                int x;
+                int y;
+                int z;
+                terrain.UnpackIndex(terrainIndex, out x, out y, out z);
+                int computeIndex = TerrainComputeIndex(terrain, x, y, z);
+                if (computeIndex < 0 || computeIndex >= n) continue;
+
+                terrainSolidCache[computeIndex] = terrain.IsSolid(x, y, z) ? 1 : 0;
+                terrainDirtyUploadIndices[count++] = computeIndex;
+            }
+
+            terrainDirtyScratch.Clear();
+            if (count <= 0) return;
+
+            System.Array.Sort(terrainDirtyUploadIndices, 0, count);
+
+            int runStart = terrainDirtyUploadIndices[0];
+            int runEnd = runStart;
+            for (int i = 1; i < count; i++)
+            {
+                int index = terrainDirtyUploadIndices[i];
+                if (index <= runEnd) continue; // ignore accidental duplicates
+                // Merge short gaps too: uploading a few unchanged ints is cheaper than many tiny GPU SetData calls.
+                if (index <= runEnd + 32)
+                {
+                    runEnd = index;
+                    continue;
+                }
+
+                UploadTerrainRun(runStart, runEnd);
+                runStart = runEnd = index;
+            }
+            UploadTerrainRun(runStart, runEnd);
+        }
+
+        private void EnsureTerrainUploadCache(int n)
+        {
+            if (terrainSolidCache == null || terrainSolidCache.Length != n) terrainSolidCache = new int[n];
+        }
+
+        private static int TerrainComputeIndex(VoxelTerrain3D terrain, int x, int y, int z)
+        {
+            return x + y * terrain.Width + z * terrain.Width * terrain.Height;
+        }
+
+        private void UploadTerrainRun(int runStart, int runEnd)
+        {
+            int count = runEnd - runStart + 1;
+            if (count <= 0) return;
+            terrainSolidBuffer.SetData(terrainSolidCache, runStart, runStart, count);
         }
 
         public void UploadFromParticles(List<SPHParticle3D> particles)
@@ -327,14 +417,16 @@ namespace MeteoriteSPH3D
         {
             if (!IsReady || depositCandidateBuffer == null || depositCandidateCounterBuffer == null || ActiveCount <= 0) return;
 
+            bool tailDepositMode = c.IsTailDepositModeActive();
             float maxTempBonus = Mathf.Max(0f, c.centerCaptureTemperatureBonus, c.rimCaptureTemperatureBonus, c.forceDepositTemperatureBonus);
-            float maxDepositTemperature = c.solidifyTemperature + maxTempBonus;
-            float maxDepositSpeed = Mathf.Max(c.solidifySpeed, c.centerCaptureMaxSpeed, c.rimCaptureMaxSpeed, c.forceDepositMaxSpeed * 2.5f);
-            float forcedAge = c.forceDepositOldParticles ? c.forceDepositAge : 999999f;
+            float maxDepositTemperature = tailDepositMode ? 1000000f : c.solidifyTemperature + maxTempBonus;
+            float maxDepositSpeed = tailDepositMode ? 1000000f : Mathf.Max(c.solidifySpeed, c.centerCaptureMaxSpeed, c.rimCaptureMaxSpeed, c.forceDepositMaxSpeed * 2.5f);
+            float forcedAge = tailDepositMode ? 0f : (c.forceDepositOldParticles ? c.forceDepositAge : 999999f);
+            float minAge = tailDepositMode ? 0f : Mathf.Min(c.solidifyMinAge, c.centerCaptureMinAge, c.rimCaptureMinAge, forcedAge);
 
             compute.SetInt("_ActiveCount", ActiveCount);
             compute.SetInt("_DepositCandidateCapacity", maxDepositCandidates);
-            compute.SetFloat("_DepositMinAge", Mathf.Min(c.solidifyMinAge, c.centerCaptureMinAge, c.rimCaptureMinAge, forcedAge));
+            compute.SetFloat("_DepositMinAge", minAge);
             compute.SetFloat("_DepositMaxTemperature", maxDepositTemperature);
             compute.SetFloat("_DepositMaxSpeed", Mathf.Max(0.01f, maxDepositSpeed));
             compute.SetFloat("_DepositForcedAge", forcedAge);
