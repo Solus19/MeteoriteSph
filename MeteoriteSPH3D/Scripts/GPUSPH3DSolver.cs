@@ -849,6 +849,8 @@ namespace MeteoriteSPH3D
             compute.SetFloat("_HotViscosityTemperature", Mathf.Max(c.hotViscosityTemperature, c.coldViscosityTemperature + 0.01f));
             compute.SetFloat("_Gravity", c.gravity);
             compute.SetFloat("_Damping", c.damping);
+            float dampingBase = Mathf.Clamp(c.damping, 0.0001f, 1f);
+            compute.SetFloat("_DampingFactor", Mathf.Pow(dampingBase, Mathf.Max(dt * 60f, 0f)));
             compute.SetFloat("_CollisionFriction", c.collisionFriction);
             compute.SetFloat("_MaxVelocity", c.maxVelocity);
             compute.SetFloat("_MaxAcceleration", c.maxAcceleration);

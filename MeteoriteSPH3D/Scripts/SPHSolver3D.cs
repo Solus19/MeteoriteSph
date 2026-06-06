@@ -59,6 +59,8 @@ namespace MeteoriteSPH3D
             float h = Mathf.Max(0.001f, c.smoothingRadius);
             float h2 = h * h;
             float spacing = Mathf.Max(c.particleSpacing, c.particleRadius * 2.05f);
+            float xsphBlend = Mathf.Clamp01(c.xsphVelocityBlend);
+            float dampingFactor = Mathf.Pow(Mathf.Clamp(c.damping, 0.0001f, 1f), dt * 60f);
 
             for (int i = 0; i < particles.Count; i++)
             {
@@ -71,6 +73,10 @@ namespace MeteoriteSPH3D
                 bool semiSolid = c.useViscoPlasticEjecta && p.temperature <= c.semiSolidTemperature;
                 float gravityMul = semiSolid ? c.semiSolidGravityMultiplier : 1f;
                 Vector3 acceleration = Vector3.down * c.gravity * gravityMul;
+
+                Vector3 baseVelocity = p.velocity;
+                Vector3 xsph = Vector3.zero;
+                float xsphW = 0f;
 
                 hash.Query(p.position, neighbours);
                 for (int n = 0; n < neighbours.Count; n++)
@@ -118,7 +124,13 @@ namespace MeteoriteSPH3D
                         pairViscosity *= c.semiSolidViscosityMultiplier;
                     }
 
-                    acceleration += (q.velocity - p.velocity) * (pairViscosity * qn / Mathf.Max(1f, q.density));
+                    Vector3 dv = q.velocity - baseVelocity;
+                    acceleration += dv * (pairViscosity * qn / Mathf.Max(1f, q.density));
+                    if (xsphBlend > 0.0001f)
+                    {
+                        xsph += dv * qn;
+                        xsphW += qn;
+                    }
                 }
 
                 float accLen = acceleration.magnitude;
@@ -129,27 +141,12 @@ namespace MeteoriteSPH3D
 
                 p.velocity += acceleration * dt;
 
-                Vector3 xsph = Vector3.zero;
-                float xsphW = 0f;
-                hash.Query(p.position, neighbours);
-                for (int n2 = 0; n2 < neighbours.Count; n2++)
+                if (xsphBlend > 0.0001f && xsphW > 0.0001f)
                 {
-                    int j2 = neighbours[n2];
-                    if (j2 == i) continue;
-                    SPHParticle3D q2 = particles[j2];
-                    if (q2 == null || !q2.active) continue;
-                    float rr = Vector3.Distance(q2.position, p.position);
-                    if (rr <= 0.0001f || rr >= h) continue;
-                    float w = Mathf.Clamp01(1f - rr / h);
-                    xsph += (q2.velocity - p.velocity) * w;
-                    xsphW += w;
-                }
-                if (xsphW > 0.0001f)
-                {
-                    p.velocity += (xsph / xsphW) * Mathf.Clamp01(c.xsphVelocityBlend) * Mathf.Clamp01(dt * 8f);
+                    p.velocity += (xsph / xsphW) * xsphBlend * Mathf.Clamp01(dt * 8f);
                 }
 
-                p.velocity *= Mathf.Pow(c.damping, dt * 60f);
+                p.velocity *= dampingFactor;
 
                 if (semiSolid)
                 {

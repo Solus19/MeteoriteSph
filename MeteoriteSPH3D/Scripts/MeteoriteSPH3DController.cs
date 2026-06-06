@@ -42,7 +42,7 @@ namespace MeteoriteSPH3D
         [Header("GPU simulation")]
         public bool useGpuSimulation = true;
         public int gpuGridMaxParticlesPerCell = 96;
-        public int gpuReadbackInterval = 3;
+        public int gpuReadbackInterval = 4;
         [Tooltip("Use AsyncGPUReadback for particle state transfer. This avoids blocking the render thread while GPU particles are copied back for deposition.")]
         public bool useAsyncGpuReadback = true;
         [Tooltip("When enabled, GPU directly chooses deposit cells and deactivates settled particles. CPU only mirrors the resulting voxel cells for rendering. This removes the expensive CPU FindDepositCell tail scan.")]
@@ -73,13 +73,21 @@ namespace MeteoriteSPH3D
         public int gpuCompactMinInactiveCount = 12000;
         public int gpuCompactCooldownFrames = 45;
         [Tooltip("Rebuild the visible voxel mesh only once per N frames while particles are freezing. Higher values reduce lag during deposition.")]
-        public int terrainMeshRebuildInterval = 1;
+        public int terrainMeshRebuildInterval = 3;
         [Tooltip("Voxel chunk side size used by the terrain renderer. 16 is a good default for this prototype.")]
-        public int terrainChunkSize = 12;
+        public int terrainChunkSize = 24;
         [Tooltip("Maximum number of voxel chunks rebuilt in one frame. Lower values reduce spikes; higher values update terrain faster.")]
-        public int maxTerrainChunkRebuildsPerFrame = 24;
+        public int maxTerrainChunkRebuildsPerFrame = 6;
         [Tooltip("MeshCollider for rebuilt chunks is refreshed only once per N frames. Physics particles use the voxel buffer, so visual mesh can update more often than colliders.")]
         public int terrainColliderUpdateInterval = 60;
+
+        [Header("Dynamic terrain shadows")]
+        [Tooltip("Keep realtime terrain chunk shadows disabled while particles are active, then enable them after the simulation fully settles.")]
+        public bool enableTerrainShadowsWhenParticlesStop = true;
+        [Tooltip("Useful only for screenshots. Keep false for stable FPS while particles are flying/depositing.")]
+        public bool terrainShadowsDuringActiveParticles = false;
+        [Tooltip("How many consecutive frames with zero active particles must pass before terrain chunk shadows are enabled.")]
+        public int terrainShadowEnableDelayFrames = 2;
 
         [Header("Impact")]
         public float impactRadius = 17.20f;
@@ -302,6 +310,8 @@ namespace MeteoriteSPH3D
         private bool tailDepositionModeLatched;
         private bool gpuTerrainDirty;
         private bool lastGpuMode;
+        private int zeroActiveParticleShadowFrames;
+        private bool terrainChunkShadowsCurrentlyEnabled;
 
         private VoxelMeshRenderer3D voxelRenderer;
         private ParticleRenderer3D particleRenderer;
@@ -360,6 +370,8 @@ namespace MeteoriteSPH3D
             voxelRenderer.Initialize();
             voxelRenderer.Configure(terrainChunkSize, maxTerrainChunkRebuildsPerFrame, terrainColliderUpdateInterval);
             voxelRenderer.RebuildImmediate(terrain);
+            zeroActiveParticleShadowFrames = Mathf.Max(0, terrainShadowEnableDelayFrames);
+            UpdateTerrainChunkShadowMode(true);
 
             GameObject particlesGo = new GameObject("SPH Particles 3D");
             particleRenderer = particlesGo.AddComponent<ParticleRenderer3D>();
@@ -382,16 +394,16 @@ namespace MeteoriteSPH3D
             // Cast Shadows and Receive Shadows enabled, and the vertex-color shader
             // now has proper Built-in + URP shadow passes.
             QualitySettings.shadows = ShadowQuality.All;
-            QualitySettings.shadowDistance = 440f;
-            QualitySettings.shadowResolution = ShadowResolution.High;
-            QualitySettings.shadowCascades = 2;
+            QualitySettings.shadowDistance = 140f;
+            QualitySettings.shadowResolution = ShadowResolution.Medium;
+            QualitySettings.shadowCascades = 1;
             QualitySettings.shadowProjection = ShadowProjection.StableFit;
             TryConfigureUrpShadows();
 
             Light key = GetOrCreateDirectionalLight("Voxel Key Light");
             key.color = new Color(1f, 0.96f, 0.88f, 1f);
             key.intensity = 1.12f;
-            key.shadows = LightShadows.Soft;
+            key.shadows = LightShadows.Hard;
             key.shadowStrength = 0.96f;
             key.shadowBias = 0.006f;
             key.shadowNormalBias = 0.035f;
@@ -422,12 +434,12 @@ namespace MeteoriteSPH3D
             SetFieldOrProperty(asset, type, "supportsMainLightShadows", true);
             SetFieldOrProperty(asset, type, "m_SoftShadowsSupported", true);
             SetFieldOrProperty(asset, type, "supportsSoftShadows", true);
-            SetFieldOrProperty(asset, type, "m_ShadowDistance", 440f);
-            SetFieldOrProperty(asset, type, "shadowDistance", 440f);
-            SetFieldOrProperty(asset, type, "m_MainLightShadowmapResolution", 4096);
-            SetFieldOrProperty(asset, type, "mainLightShadowmapResolution", 4096);
-            SetFieldOrProperty(asset, type, "m_ShadowCascadeCount", 2);
-            SetFieldOrProperty(asset, type, "shadowCascadeCount", 2);
+            SetFieldOrProperty(asset, type, "m_ShadowDistance", 140f);
+            SetFieldOrProperty(asset, type, "shadowDistance", 140f);
+            SetFieldOrProperty(asset, type, "m_MainLightShadowmapResolution", 2048);
+            SetFieldOrProperty(asset, type, "mainLightShadowmapResolution", 2048);
+            SetFieldOrProperty(asset, type, "m_ShadowCascadeCount", 1);
+            SetFieldOrProperty(asset, type, "shadowCascadeCount", 1);
         }
 
         private static void SetFieldOrProperty(object target, System.Type type, string name, object value)
@@ -597,6 +609,8 @@ namespace MeteoriteSPH3D
             LastGpuParticleUploadMs = 0f;
             LastMeshRebuildMs = 0f;
             lastGpuMode = UseGpuSimulation;
+            zeroActiveParticleShadowFrames = Mathf.Max(0, terrainShadowEnableDelayFrames);
+            UpdateTerrainChunkShadowMode(true);
             if (useGpuSimulation && gpuSolver.IsReady)
             {
                 gpuSolver.UploadTerrain(terrain);
@@ -707,7 +721,7 @@ namespace MeteoriteSPH3D
             forceDepositTemperatureBonus = 500f;
             forceDepositGroundSnapDistanceCells = 6f;
             forcedDepositSearchRadiusCells = 7;
-            gpuReadbackInterval = 3;
+            gpuReadbackInterval = 4;
             useAsyncGpuReadback = true;
             useGpuDirectDeposition = true;
             gpuDirectDepositionOnlyInTail = true;
@@ -726,9 +740,9 @@ namespace MeteoriteSPH3D
             gpuCompactInactiveRatio = 0.28f;
             gpuCompactMinInactiveCount = 12000;
             gpuCompactCooldownFrames = 45;
-            terrainMeshRebuildInterval = 1;
-            terrainChunkSize = 12;
-            maxTerrainChunkRebuildsPerFrame = 24;
+            terrainMeshRebuildInterval = 3;
+            terrainChunkSize = 24;
+            maxTerrainChunkRebuildsPerFrame = 6;
             terrainColliderUpdateInterval = 60;
 
             rimCaptureEnabled = true;
@@ -963,10 +977,38 @@ namespace MeteoriteSPH3D
                 particleRenderer.SetRadius(particleRadius);
             }
 
+            UpdateTerrainChunkShadowMode();
+
             LastControllerUpdateMs = Time.realtimeSinceStartup * 1000f - updateStartMs;
         }
 
 
+
+        private void UpdateTerrainChunkShadowMode(bool force = false)
+        {
+            if (voxelRenderer == null) return;
+
+            bool particlesActive = ActiveParticleCount > 0;
+            if (particlesActive)
+            {
+                zeroActiveParticleShadowFrames = 0;
+            }
+            else
+            {
+                zeroActiveParticleShadowFrames++;
+            }
+
+            bool shouldEnable = terrainShadowsDuringActiveParticles;
+            if (!particlesActive && enableTerrainShadowsWhenParticlesStop)
+            {
+                shouldEnable = zeroActiveParticleShadowFrames >= Mathf.Max(0, terrainShadowEnableDelayFrames);
+            }
+
+            if (!force && terrainChunkShadowsCurrentlyEnabled == shouldEnable) return;
+
+            terrainChunkShadowsCurrentlyEnabled = shouldEnable;
+            voxelRenderer.SetRealtimeChunkShadows(shouldEnable);
+        }
 
         private bool UseDirectGpuDepositionThisFrame()
         {
@@ -1405,6 +1447,8 @@ namespace MeteoriteSPH3D
                 gpuSolver.UploadFromParticles(particles);
                 LastGpuParticleUploadMs += Time.realtimeSinceStartup * 1000f - uploadParticlesStartMs;
             }
+
+            UpdateTerrainChunkShadowMode(true);
         }
 
         private int ComputeScaledRimHeightCells(float radius)

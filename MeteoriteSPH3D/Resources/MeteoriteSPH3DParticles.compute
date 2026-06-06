@@ -82,6 +82,7 @@ float _ColdViscosityTemperature;
 float _HotViscosityTemperature;
 float _Gravity;
 float _Damping;
+float _DampingFactor;
 float _CollisionFriction;
 float _MaxVelocity;
 float _MaxAcceleration;
@@ -227,6 +228,11 @@ void Integrate(uint3 id : SV_DispatchThreadID)
     bool semiSolid = p.temperature <= _SemiSolidTemperature;
     float gravityMul = semiSolid ? _SemiSolidGravityMultiplier : 1.0;
     float3 acc = float3(0.0, -_Gravity * gravityMul, 0.0);
+    float spacing = min(max(_ParticleSpacing, _ParticleRadius * 2.0), h * 0.98);
+    float xsphBlend = saturate(_XsphVelocityBlend);
+    float3 xsph = float3(0.0, 0.0, 0.0);
+    float xsphW = 0.0;
+    float3 baseVelocity = p.velocity;
 
     int3 baseCell = ParticleCell(p.position);
     [loop]
@@ -254,21 +260,21 @@ void Integrate(uint3 id : SV_DispatchThreadID)
             float3 dir = diff / r;
             float qn = saturate(1.0 - r / h);
 
+            float invQDens = 1.0 / max(_MinDensity, q.density);
             float pressurePair = (p.pressure + q.pressure) * 0.5;
-            acc += dir * (_PressureStrength * pressurePair * qn * qn / max(_MinDensity, q.density));
+            acc += dir * (_PressureStrength * pressurePair * qn * qn * invQDens);
 
             // Near pressure now acts through the full smoothing radius, not only inside
             // particle spacing. This makes particle-particle interaction visible earlier.
             float nearPair = (p.nearDensity + q.nearDensity) * 0.5;
             float nearKernelWide = qn * qn * qn;
-            acc += dir * (_NearPressureStrength * nearPair * nearKernelWide / max(_MinDensity, q.density));
+            acc += dir * (_NearPressureStrength * nearPair * nearKernelWide * invQDens);
 
-            float spacing = min(max(_ParticleSpacing, _ParticleRadius * 2.0), h * 0.98);
             if (r < spacing)
             {
                 float sn = saturate(1.0 - r / spacing);
                 float nearKernelContact = sn * sn * (2.0 - sn);
-                acc += dir * (_NearPressureStrength * 0.55 * nearPair * nearKernelContact / max(_MinDensity, q.density));
+                acc += dir * (_NearPressureStrength * 0.55 * nearPair * nearKernelContact * invQDens);
             }
             else
             {
@@ -277,14 +283,20 @@ void Integrate(uint3 id : SV_DispatchThreadID)
                 float denom = max(0.0001, h - spacing);
                 float ct = saturate((r - spacing) / denom);
                 float cohesionKernel = ct * (1.0 - ct) * 4.0;
-                acc -= dir * (_CohesionStrength * cohesionKernel * q.mass / max(_MinDensity, q.density));
+                acc -= dir * (_CohesionStrength * cohesionKernel * q.mass * invQDens);
             }
 
             float pairTemp = (p.temperature + q.temperature) * 0.5;
             float tempT = saturate((pairTemp - _ColdViscosityTemperature) / max(0.0001, _HotViscosityTemperature - _ColdViscosityTemperature));
             float pairVisc = _Viscosity * lerp(_ColdViscosityMultiplier, 1.0, tempT);
             if (semiSolid || q.temperature <= _SemiSolidTemperature) pairVisc *= _SemiSolidViscosityMultiplier;
-            acc += (q.velocity - p.velocity) * (pairVisc * qn / max(1.0, q.density));
+            float3 dv = q.velocity - baseVelocity;
+            acc += dv * (pairVisc * qn / max(1.0, q.density));
+            if (xsphBlend > 0.0001)
+            {
+                xsph += dv * qn;
+                xsphW += qn;
+            }
         }
     }
 
@@ -293,48 +305,15 @@ void Integrate(uint3 id : SV_DispatchThreadID)
 
     p.velocity += acc * dt;
 
-    // XSPH-like neighbour velocity blending. When blend is zero, skip the extra neighbour pass entirely.
-    float xsphBlend = saturate(_XsphVelocityBlend);
-    if (xsphBlend > 0.0001)
+    // XSPH is accumulated during the force pass above, so Integrate no longer
+    // performs a second 27-cell neighbour traversal.
+    if (xsphBlend > 0.0001 && xsphW > 0.0001)
     {
-        float3 xsph = float3(0.0, 0.0, 0.0);
-        float xsphW = 0.0;
-        [loop]
-        for (int dz2 = -1; dz2 <= 1; dz2++)
-        [loop]
-        for (int dy2 = -1; dy2 <= 1; dy2++)
-        [loop]
-        for (int dx2 = -1; dx2 <= 1; dx2++)
-        {
-            int3 nc2 = baseCell + int3(dx2, dy2, dz2);
-            if (any(nc2 < int3(0,0,0)) || any(nc2 >= _GridSize)) continue;
-            int ci2 = CellIndex(nc2);
-            int count2 = min(_CellCounts[ci2], _MaxParticlesPerCell);
-            [loop]
-            for (int n2 = 0; n2 < count2; n2++)
-            {
-                int qi2 = _CellItems[ci2 * _MaxParticlesPerCell + n2];
-                if (qi2 == (int)i) continue;
-                Particle q2 = _Particles[qi2];
-                if (q2.active < 0.5) continue;
-                float3 d2 = q2.position - p.position;
-                float rr2 = dot(d2, d2);
-                if (rr2 <= 0.0000001 || rr2 >= h * h) continue;
-                float rr = sqrt(rr2);
-                float w = saturate(1.0 - rr / h);
-                xsph += (q2.velocity - p.velocity) * w;
-                xsphW += w;
-            }
-        }
-        if (xsphW > 0.0001)
-        {
-            p.velocity += (xsph / xsphW) * xsphBlend * saturate(dt * 8.0);
-        }
+        p.velocity += (xsph / xsphW) * xsphBlend * saturate(dt * 8.0);
     }
 
-    float dampingBase = max(saturate(_Damping), 0.0001);
-    float dampingPower = max(dt * 60.0, 0.0);
-    p.velocity *= exp(log(dampingBase) * dampingPower);
+    // Precomputed on CPU per dispatch. Avoid exp(log()) per particle.
+    p.velocity *= _DampingFactor;
     if (semiSolid) p.velocity *= lerp(1.0, _SemiSolidVelocityDamping, saturate(dt * 10.0));
 
     float speed = length(p.velocity);

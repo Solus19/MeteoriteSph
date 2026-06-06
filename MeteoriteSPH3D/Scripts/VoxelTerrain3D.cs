@@ -250,15 +250,11 @@ namespace MeteoriteSPH3D
                     int center = heightMap[x + z * Width] * 5;
                     int cross = 0;
                     int crossCount = 0;
-                    int[] oxs = { 1, -1, 0, 0 };
-                    int[] ozs = { 0, 0, 1, -1 };
-                    for (int i = 0; i < 4; i++)
-                    {
-                        int sx = Mathf.Clamp(x + oxs[i], 0, Width - 1);
-                        int sz = Mathf.Clamp(z + ozs[i], 0, Depth - 1);
-                        cross += heightMap[sx + sz * Width];
-                        crossCount++;
-                    }
+                    cross += heightMap[Mathf.Clamp(x + 1, 0, Width - 1) + Mathf.Clamp(z, 0, Depth - 1) * Width];
+                    cross += heightMap[Mathf.Clamp(x - 1, 0, Width - 1) + Mathf.Clamp(z, 0, Depth - 1) * Width];
+                    cross += heightMap[Mathf.Clamp(x, 0, Width - 1) + Mathf.Clamp(z + 1, 0, Depth - 1) * Width];
+                    cross += heightMap[Mathf.Clamp(x, 0, Width - 1) + Mathf.Clamp(z - 1, 0, Depth - 1) * Width];
+                    crossCount = 4;
                     smooth[x + z * Width] = Mathf.RoundToInt((center + cross) / (float)(5 + crossCount));
                 }
             }
@@ -469,7 +465,7 @@ namespace MeteoriteSPH3D
                 if (!c.solid && c.temperature <= 0f && c.pressure <= 0f)
                 {
                     thermalQueued[i] = false;
-                    thermalIndices.RemoveAt(t);
+                    RemoveThermalAtSwap(t);
                     continue;
                 }
 
@@ -481,9 +477,16 @@ namespace MeteoriteSPH3D
                 if (c.temperature <= 0f && c.pressure <= 0f)
                 {
                     thermalQueued[i] = false;
-                    thermalIndices.RemoveAt(t);
+                    RemoveThermalAtSwap(t);
                 }
             }
+        }
+
+        private void RemoveThermalAtSwap(int indexInList)
+        {
+            int last = thermalIndices.Count - 1;
+            thermalIndices[indexInList] = thermalIndices[last];
+            thermalIndices.RemoveAt(last);
         }
 
         private void QueueThermalIfNeeded(int index, VoxelCell3D cell)
