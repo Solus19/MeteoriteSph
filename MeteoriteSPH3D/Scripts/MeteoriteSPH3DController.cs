@@ -89,6 +89,28 @@ namespace MeteoriteSPH3D
         [Tooltip("How many consecutive frames with zero active particles must pass before terrain chunk shadows are enabled.")]
         public int terrainShadowEnableDelayFrames = 2;
 
+        [Header("Final visual quality after particles stop")]
+        [Tooltip("Use cheaper lighting while particles are active, then restore the original high-quality shadow settings after all particles settle.")]
+        public bool restoreHighQualityLightingWhenParticlesStop = true;
+        public float activeShadowDistance = 140f;
+        public ShadowResolution activeShadowResolution = ShadowResolution.Medium;
+        public int activeShadowCascades = 1;
+        public int activeMainLightShadowmapResolution = 2048;
+        public LightShadows activeDirectionalLightShadows = LightShadows.Hard;
+        public float settledShadowDistance = 440f;
+        public ShadowResolution settledShadowResolution = ShadowResolution.High;
+        public int settledShadowCascades = 2;
+        public int settledMainLightShadowmapResolution = 4096;
+        public LightShadows settledDirectionalLightShadows = LightShadows.Soft;
+        [Tooltip("After all particles settle, force one final terrain rebuild with screenshot-quality terrain renderer options.")]
+        public bool restoreTerrainRenderWhenParticlesStop = true;
+        [Tooltip("Keep the optimized heightfield terrain mesh in final mode. Disable only if you explicitly want the very expensive full voxel mesh.")]
+        public bool finalUseHeightfieldMeshing = true;
+        [Tooltip("Optional vertex-color shadowing pass for final terrain. Rebuilds once after particles stop and improves crater readability.")]
+        public bool finalUseBakedDirectionalTerrainShadows = true;
+        public bool activeUseHeightfieldMeshing = true;
+        public bool activeUseBakedDirectionalTerrainShadows = false;
+
         [Header("Impact")]
         public float impactRadius = 17.20f;
         public float impactPressure = 470f;
@@ -312,6 +334,7 @@ namespace MeteoriteSPH3D
         private bool lastGpuMode;
         private int zeroActiveParticleShadowFrames;
         private bool terrainChunkShadowsCurrentlyEnabled;
+        private bool finalVisualQualityCurrentlyEnabled;
 
         private VoxelMeshRenderer3D voxelRenderer;
         private ParticleRenderer3D particleRenderer;
@@ -393,17 +416,11 @@ namespace MeteoriteSPH3D
             // Real shadow maps are enabled here. The voxel chunks below have
             // Cast Shadows and Receive Shadows enabled, and the vertex-color shader
             // now has proper Built-in + URP shadow passes.
-            QualitySettings.shadows = ShadowQuality.All;
-            QualitySettings.shadowDistance = 140f;
-            QualitySettings.shadowResolution = ShadowResolution.Medium;
-            QualitySettings.shadowCascades = 1;
-            QualitySettings.shadowProjection = ShadowProjection.StableFit;
-            TryConfigureUrpShadows();
+            ApplyLightingQuality(true, true);
 
             Light key = GetOrCreateDirectionalLight("Voxel Key Light");
             key.color = new Color(1f, 0.96f, 0.88f, 1f);
             key.intensity = 1.12f;
-            key.shadows = LightShadows.Hard;
             key.shadowStrength = 0.96f;
             key.shadowBias = 0.006f;
             key.shadowNormalBias = 0.035f;
@@ -420,7 +437,41 @@ namespace MeteoriteSPH3D
             fill.transform.rotation = Quaternion.Euler(18f, 132f, 0f);
         }
 
-        private static void TryConfigureUrpShadows()
+        private void ApplyLightingQuality(bool settledQuality, bool force = false)
+        {
+            if (!force && finalVisualQualityCurrentlyEnabled == settledQuality) return;
+
+            finalVisualQualityCurrentlyEnabled = settledQuality;
+
+            bool useSettled = settledQuality && restoreHighQualityLightingWhenParticlesStop;
+            float distance = useSettled ? settledShadowDistance : activeShadowDistance;
+            ShadowResolution resolution = useSettled ? settledShadowResolution : activeShadowResolution;
+            int cascades = Mathf.Clamp(useSettled ? settledShadowCascades : activeShadowCascades, 0, 4);
+            int shadowmap = Mathf.Max(256, useSettled ? settledMainLightShadowmapResolution : activeMainLightShadowmapResolution);
+            LightShadows lightShadows = useSettled ? settledDirectionalLightShadows : activeDirectionalLightShadows;
+
+            QualitySettings.shadows = ShadowQuality.All;
+            QualitySettings.shadowDistance = distance;
+            QualitySettings.shadowResolution = resolution;
+            QualitySettings.shadowCascades = cascades;
+            QualitySettings.shadowProjection = ShadowProjection.StableFit;
+            TryConfigureUrpShadows(distance, shadowmap, cascades, lightShadows == LightShadows.Soft);
+
+            Light key = GetOrCreateDirectionalLight("Voxel Key Light");
+            key.shadows = lightShadows;
+        }
+
+        private void ApplyTerrainRenderQuality(bool settledQuality, bool forceRebuild)
+        {
+            if (voxelRenderer == null) return;
+
+            bool useFinal = settledQuality && restoreTerrainRenderWhenParticlesStop;
+            bool useHeightfield = useFinal ? finalUseHeightfieldMeshing : activeUseHeightfieldMeshing;
+            bool useBakedShadows = useFinal ? finalUseBakedDirectionalTerrainShadows : activeUseBakedDirectionalTerrainShadows;
+            voxelRenderer.SetTerrainRenderQuality(useHeightfield, useBakedShadows, terrain, forceRebuild);
+        }
+
+        private static void TryConfigureUrpShadows(float shadowDistance, int shadowmapResolution, int cascadeCount, bool softShadows)
         {
             // If the host project uses URP, its asset can silently disable main-light shadows.
             // Use reflection so this folder still compiles in Built-in projects without a URP assembly reference.
@@ -432,14 +483,14 @@ namespace MeteoriteSPH3D
 
             SetFieldOrProperty(asset, type, "m_MainLightShadowsSupported", true);
             SetFieldOrProperty(asset, type, "supportsMainLightShadows", true);
-            SetFieldOrProperty(asset, type, "m_SoftShadowsSupported", true);
-            SetFieldOrProperty(asset, type, "supportsSoftShadows", true);
-            SetFieldOrProperty(asset, type, "m_ShadowDistance", 140f);
-            SetFieldOrProperty(asset, type, "shadowDistance", 140f);
-            SetFieldOrProperty(asset, type, "m_MainLightShadowmapResolution", 2048);
-            SetFieldOrProperty(asset, type, "mainLightShadowmapResolution", 2048);
-            SetFieldOrProperty(asset, type, "m_ShadowCascadeCount", 1);
-            SetFieldOrProperty(asset, type, "shadowCascadeCount", 1);
+            SetFieldOrProperty(asset, type, "m_SoftShadowsSupported", softShadows);
+            SetFieldOrProperty(asset, type, "supportsSoftShadows", softShadows);
+            SetFieldOrProperty(asset, type, "m_ShadowDistance", shadowDistance);
+            SetFieldOrProperty(asset, type, "shadowDistance", shadowDistance);
+            SetFieldOrProperty(asset, type, "m_MainLightShadowmapResolution", shadowmapResolution);
+            SetFieldOrProperty(asset, type, "mainLightShadowmapResolution", shadowmapResolution);
+            SetFieldOrProperty(asset, type, "m_ShadowCascadeCount", cascadeCount);
+            SetFieldOrProperty(asset, type, "shadowCascadeCount", cascadeCount);
         }
 
         private static void SetFieldOrProperty(object target, System.Type type, string name, object value)
@@ -998,16 +1049,22 @@ namespace MeteoriteSPH3D
                 zeroActiveParticleShadowFrames++;
             }
 
-            bool shouldEnable = terrainShadowsDuringActiveParticles;
-            if (!particlesActive && enableTerrainShadowsWhenParticlesStop)
+            bool settledQuality = !particlesActive && zeroActiveParticleShadowFrames >= Mathf.Max(0, terrainShadowEnableDelayFrames);
+
+            bool shouldEnableChunkShadows = terrainShadowsDuringActiveParticles;
+            if (settledQuality && enableTerrainShadowsWhenParticlesStop)
             {
-                shouldEnable = zeroActiveParticleShadowFrames >= Mathf.Max(0, terrainShadowEnableDelayFrames);
+                shouldEnableChunkShadows = true;
             }
 
-            if (!force && terrainChunkShadowsCurrentlyEnabled == shouldEnable) return;
+            bool visualModeChanged = force || terrainChunkShadowsCurrentlyEnabled != shouldEnableChunkShadows || finalVisualQualityCurrentlyEnabled != settledQuality;
+            if (!visualModeChanged) return;
 
-            terrainChunkShadowsCurrentlyEnabled = shouldEnable;
-            voxelRenderer.SetRealtimeChunkShadows(shouldEnable);
+            terrainChunkShadowsCurrentlyEnabled = shouldEnableChunkShadows;
+            voxelRenderer.SetRealtimeChunkShadows(shouldEnableChunkShadows);
+
+            ApplyLightingQuality(settledQuality, force);
+            ApplyTerrainRenderQuality(settledQuality, settledQuality && visualModeChanged);
         }
 
         private bool UseDirectGpuDepositionThisFrame()

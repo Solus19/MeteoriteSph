@@ -142,6 +142,24 @@ namespace MeteoriteSPH3D
             ApplyRealtimeChunkShadowState();
         }
 
+        public void SetTerrainRenderQuality(bool heightfieldMeshing, bool bakedDirectionalShadows, VoxelTerrain3D terrain, bool rebuildNow)
+        {
+            bool changed = useHeightfieldMeshing != heightfieldMeshing || useBakedDirectionalShadows != bakedDirectionalShadows;
+            if (!changed) return;
+
+            useHeightfieldMeshing = heightfieldMeshing;
+            useBakedDirectionalShadows = bakedDirectionalShadows;
+
+            if (rebuildNow && terrain != null)
+            {
+                RebuildImmediate(terrain);
+            }
+            else
+            {
+                builtAtLeastOnce = false;
+            }
+        }
+
         private void ApplyRealtimeChunkShadowState()
         {
             if (chunks == null) return;
