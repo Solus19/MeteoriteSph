@@ -116,8 +116,10 @@ namespace MeteoriteSPH3D
         public bool deferVisualApplyUntilParticlesStop = true;
         [Tooltip("Do not draw particles while deferred visual apply is active. The simulation still runs on GPU/CPU.")]
         public bool hideParticlesDuringDeferredApply = true;
-        [Tooltip("During deferred visual apply, use GPU-side deposition for the whole run so CPU does not update visible terrain every few frames.")]
-        public bool forceGpuDirectDepositionDuringDeferredApply = true;
+        [Tooltip("During deferred visual apply, do NOT switch to a different deposition algorithm. Keep false if the hidden/background result must match the normal rendered simulation.")]
+        public bool forceGpuDirectDepositionDuringDeferredApply = false;
+        [Tooltip("Legacy mode: store particles and place them only at final commit. This can diverge from the normal rendered simulation because intermediate deposits do not affect later collisions. Keep false for matching results.")]
+        public bool useCpuFinalDepositionForDeferredVisualApply = false;
         [Tooltip("When the hidden run finishes, rebuild all terrain chunks immediately in one final visible update.")]
         public bool rebuildTerrainImmediatelyAfterDeferredApply = true;
         [Tooltip("How many consecutive zero-active-particle frames must pass before committing the deferred terrain changes.")]
@@ -332,6 +334,8 @@ namespace MeteoriteSPH3D
 
         private VoxelTerrain3D terrain;
         private readonly List<SPHParticle3D> particles = new List<SPHParticle3D>(8192);
+        private readonly List<SPHParticle3D> deferredCpuDepositCandidates = new List<SPHParticle3D>(32768);
+        private readonly HashSet<int> deferredCpuDepositGpuIndices = new HashSet<int>();
         private readonly List<GPUSPH3DSolver.DepositedVoxel> gpuDepositedVoxels = new List<GPUSPH3DSolver.DepositedVoxel>(8192);
         private readonly List<GPUSPH3DSolver.DepositedVoxel> deferredGpuDepositedVoxels = new List<GPUSPH3DSolver.DepositedVoxel>(32768);
         private readonly List<int> pendingGpuDeactivateIndices = new List<int>(512);
@@ -660,6 +664,8 @@ namespace MeteoriteSPH3D
             pendingGpuDeactivateIndices.Clear();
             gpuDepositedVoxels.Clear();
             deferredGpuDepositedVoxels.Clear();
+            deferredCpuDepositCandidates.Clear();
+            deferredCpuDepositGpuIndices.Clear();
             pendingDeposits.Clear();
             depositionBatchFramesElapsed = 0;
             deferredVisualApplyActive = false;
@@ -817,7 +823,8 @@ namespace MeteoriteSPH3D
             terrainColliderUpdateInterval = 60;
             deferVisualApplyUntilParticlesStop = true;
             hideParticlesDuringDeferredApply = true;
-            forceGpuDirectDepositionDuringDeferredApply = true;
+            forceGpuDirectDepositionDuringDeferredApply = false;
+            useCpuFinalDepositionForDeferredVisualApply = false;
             rebuildTerrainImmediatelyAfterDeferredApply = true;
             deferredApplyZeroParticleDelayFrames = 2;
 
@@ -1097,21 +1104,21 @@ namespace MeteoriteSPH3D
         private bool UseDirectGpuDepositionThisFrame()
         {
             if (!UseGpuSimulation) return false;
-            if (IsDeferredVisualApplyActive && forceGpuDirectDepositionDuringDeferredApply) return true;
+            if (IsDeferredVisualApplyActive)
+            {
+                if (useCpuFinalDepositionForDeferredVisualApply) return false;
+                if (forceGpuDirectDepositionDuringDeferredApply) return true;
+            }
             if (!useGpuDirectDeposition) return false;
             return !gpuDirectDepositionOnlyInTail || IsTailDepositModeActive();
         }
 
         private void HandleGpuDepositedVoxels()
         {
-            if (IsDeferredVisualApplyActive)
-            {
-                AccumulateDeferredGpuDeposits();
-            }
-            else
-            {
-                ProcessGpuDepositedVoxels();
-            }
+            // Deferred mode freezes only the visible mesh. The simulation terrain must still be
+            // updated by the exact same deposition path as in the normal rendered run; otherwise
+            // the hidden/background crater diverges from the crater produced with rendering on.
+            ProcessGpuDepositedVoxels();
         }
 
         private void AccumulateDeferredGpuDeposits()
@@ -1127,6 +1134,36 @@ namespace MeteoriteSPH3D
             LastSolidifyMs += Time.realtimeSinceStartup * 1000f - startMs;
         }
 
+
+        private int ApplyDeferredCpuFinalDeposition()
+        {
+            if (terrain == null || deferredCpuDepositCandidates.Count == 0) return 0;
+
+            int placed = 0;
+            bool tailForcedDeposit = tailDepositionModeLatched;
+            for (int i = 0; i < deferredCpuDepositCandidates.Count; i++)
+            {
+                SPHParticle3D p = deferredCpuDepositCandidates[i];
+                if (p == null) continue;
+
+                float speed = p.velocity.magnitude;
+                bool normal = p.age >= solidifyMinAge && p.temperature <= solidifyTemperature && speed <= solidifySpeed && p.recentGroundContact > 0f;
+                bool center = IsCenterCaptureAllowed(p, speed);
+                bool rim = IsRimCaptureAllowed(p, speed);
+                bool forced = tailForcedDeposit || IsForcedDepositAllowed(p, speed);
+                if (!(normal || center || rim || forced)) continue;
+
+                Vector3Int deposit;
+                if (!FindDepositCell(p.position, rim, center, forced, out deposit)) continue;
+
+                float depositTemperature = Mathf.Min(p.temperature, sculptRimTemperature);
+                placed += DepositParticleMaterial(deposit, depositTemperature, rim, center, forced);
+            }
+
+            deferredCpuDepositCandidates.Clear();
+            deferredCpuDepositGpuIndices.Clear();
+            return placed;
+        }
 
         private void ProcessGpuDepositedVoxels()
         {
@@ -1192,27 +1229,14 @@ namespace MeteoriteSPH3D
 
             float startMs = Time.realtimeSinceStartup * 1000f;
 
+            // Apply only the deposits already queued by the normal live algorithm.
+            // Do not re-place particles here: deferred mode now freezes visualization only,
+            // so terrain mutations have already happened during the hidden simulation.
             FlushPendingDeposits(true);
 
-            int placed = 0;
-            for (int i = 0; i < deferredGpuDepositedVoxels.Count; i++)
-            {
-                GPUSPH3DSolver.DepositedVoxel d = deferredGpuDepositedVoxels[i];
-                if (terrain == null || !terrain.InBounds(d.x, d.y, d.z)) continue;
-                if (terrain.IsSolid(d.x, d.y, d.z)) continue;
-
-                float temp = Mathf.Max(1f, Mathf.Min(d.temperature, sculptRimTemperature));
-                terrain.SetSolid(d.x, d.y, d.z, true, temp, 0f, 0.1f, true);
-                placed++;
-            }
-
             deferredGpuDepositedVoxels.Clear();
-
-            if (placed > 0)
-            {
-                LastSolidifiedParticles += placed;
-                TotalSolidifiedParticles += placed;
-            }
+            deferredCpuDepositCandidates.Clear();
+            deferredCpuDepositGpuIndices.Clear();
 
             particles.Clear();
             pendingGpuDeactivateIndices.Clear();
@@ -1255,6 +1279,23 @@ namespace MeteoriteSPH3D
         {
             int before = particles.Count;
 
+            if (IsDeferredVisualApplyActive && useCpuFinalDepositionForDeferredVisualApply && partialCandidateReadback)
+            {
+                float collectStartMs = Time.realtimeSinceStartup * 1000f;
+                int collected = AccumulateDeferredCpuDepositCandidates();
+                LastSolidifyMs += Time.realtimeSinceStartup * 1000f - collectStartMs;
+
+                if (pendingGpuDeactivateIndices.Count > 0)
+                {
+                    gpuSolver.DeactivateParticles(pendingGpuDeactivateIndices);
+                    pendingGpuDeactivateIndices.Clear();
+                }
+
+                particles.Clear();
+                TryCompactGpuParticles();
+                return;
+            }
+
             float solidifyStartMs = Time.realtimeSinceStartup * 1000f;
             int solidified = SolidifyParticles();
             LastSolidifyMs += Time.realtimeSinceStartup * 1000f - solidifyStartMs;
@@ -1279,6 +1320,33 @@ namespace MeteoriteSPH3D
             }
 
             TryCompactGpuParticles();
+        }
+
+        private int AccumulateDeferredCpuDepositCandidates()
+        {
+            if (particles.Count == 0) return 0;
+
+            int collected = 0;
+            for (int i = 0; i < particles.Count; i++)
+            {
+                SPHParticle3D p = particles[i];
+                if (p == null || !p.active) continue;
+
+                int gpuIndex = p.gpuIndex;
+                if (gpuIndex >= 0 && !deferredCpuDepositGpuIndices.Add(gpuIndex)) continue;
+
+                SPHParticle3D copy = new SPHParticle3D(p.position, p.velocity, p.temperature, p.mass);
+                copy.age = p.age;
+                copy.recentGroundContact = p.recentGroundContact;
+                copy.gpuIndex = gpuIndex;
+                copy.active = true;
+                deferredCpuDepositCandidates.Add(copy);
+
+                if (gpuIndex >= 0) pendingGpuDeactivateIndices.Add(gpuIndex);
+                collected++;
+            }
+
+            return collected;
         }
 
 
@@ -1541,6 +1609,8 @@ namespace MeteoriteSPH3D
         {
             FlushPendingDeposits(true);
             deferredGpuDepositedVoxels.Clear();
+            deferredCpuDepositCandidates.Clear();
+            deferredCpuDepositGpuIndices.Clear();
             deferredVisualApplyActive = false;
             deferredZeroActiveFrames = 0;
 
