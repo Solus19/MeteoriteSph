@@ -45,7 +45,13 @@ namespace MeteoriteSPH3D
         public int gpuReadbackInterval = 3;
         [Tooltip("Use AsyncGPUReadback for particle state transfer. This avoids blocking the render thread while GPU particles are copied back for deposition.")]
         public bool useAsyncGpuReadback = true;
-        [Tooltip("When enabled, GPU sends only broad deposit candidates to CPU instead of downloading the full particle buffer every readback interval.")]
+        [Tooltip("When enabled, GPU directly chooses deposit cells and deactivates settled particles. CPU only mirrors the resulting voxel cells for rendering. This removes the expensive CPU FindDepositCell tail scan.")]
+        public bool useGpuDirectDeposition = true;
+        [Tooltip("Use direct GPU deposition only after the active particle estimate drops below tailForceDepositInitialFraction. This keeps the detailed CPU placement for the main crater and removes the expensive tail lag.")]
+        public bool gpuDirectDepositionOnlyInTail = true;
+        [Tooltip("When direct GPU deposition is enabled, skip CPU thermal cooling of voxel colors during active GPU simulation. This avoids a per-frame main-thread thermal list walk.")]
+        public bool coolVoxelsOnCpuDuringGpuSimulation = false;
+        [Tooltip("When enabled, GPU sends only broad deposit candidates to CPU instead of downloading the full particle buffer every readback interval. Ignored when useGpuDirectDeposition is true.")]
         public bool useGpuDepositCandidateReadback = true;
         [Tooltip("Maximum number of potential deposit particles copied from GPU to CPU per readback. Increase if very large impacts stop depositing material fast enough.")]
         public int gpuDepositCandidateCapacity = 8192;
@@ -261,7 +267,8 @@ namespace MeteoriteSPH3D
         public List<SPHParticle3D> Particles { get { return particles; } }
         public bool UseGpuSimulation { get { return useGpuSimulation && gpuSolver != null && gpuSolver.IsReady; } }
         public ComputeBuffer GpuParticleBuffer { get { return UseGpuSimulation ? gpuSolver.ParticleBuffer : null; } }
-        public int ActiveParticleCount { get { return UseGpuSimulation ? gpuSolver.ActiveCount : particles.Count; } }
+        public int ActiveParticleCount { get { return UseGpuSimulation ? gpuSolver.LiveActiveEstimate : particles.Count; } }
+        public int GpuParticleDrawCount { get { return UseGpuSimulation ? gpuSolver.ActiveCount : particles.Count; } }
         public int SolidVoxelCount { get { return terrain != null ? terrain.SolidCount : 0; } }
         public bool IsPaused { get { return paused; } }
 
@@ -281,6 +288,7 @@ namespace MeteoriteSPH3D
 
         private VoxelTerrain3D terrain;
         private readonly List<SPHParticle3D> particles = new List<SPHParticle3D>(8192);
+        private readonly List<GPUSPH3DSolver.DepositedVoxel> gpuDepositedVoxels = new List<GPUSPH3DSolver.DepositedVoxel>(8192);
         private readonly List<int> pendingGpuDeactivateIndices = new List<int>(512);
         private readonly SPHSolver3D solver = new SPHSolver3D();
         private readonly GPUSPH3DSolver gpuSolver = new GPUSPH3DSolver();
@@ -570,6 +578,7 @@ namespace MeteoriteSPH3D
             timeSinceLastImpact = 999f;
             gpuCompactCooldownRemaining = 0;
             pendingGpuDeactivateIndices.Clear();
+            gpuDepositedVoxels.Clear();
             pendingDeposits.Clear();
             depositionBatchFramesElapsed = 0;
             lastImpactInitialParticleCount = 0;
@@ -700,6 +709,9 @@ namespace MeteoriteSPH3D
             forcedDepositSearchRadiusCells = 7;
             gpuReadbackInterval = 3;
             useAsyncGpuReadback = true;
+            useGpuDirectDeposition = true;
+            gpuDirectDepositionOnlyInTail = true;
+            coolVoxelsOnCpuDuringGpuSimulation = false;
             useGpuDepositCandidateReadback = true;
             gpuDepositCandidateCapacity = 8192;
             gpuTerrainUploadInterval = 4;
@@ -830,7 +842,40 @@ namespace MeteoriteSPH3D
                     }
                     LastGpuSimulationMs += Time.realtimeSinceStartup * 1000f - simStartMs;
 
-                    if (useAsyncGpuReadback && gpuSolver.SupportsAsyncReadback)
+                    bool directGpuDepositionThisFrame = UseDirectGpuDepositionThisFrame();
+                    if (directGpuDepositionThisFrame)
+                    {
+                        if (useAsyncGpuReadback && gpuSolver.SupportsAsyncReadback)
+                        {
+                            float readbackStartMs = Time.realtimeSinceStartup * 1000f;
+                            bool completed = gpuSolver.TryConsumeGpuDepositReadback(gpuDepositedVoxels);
+                            if (completed)
+                            {
+                                LastGpuReadbackMs += Time.realtimeSinceStartup * 1000f - readbackStartMs;
+                                ProcessGpuDepositedVoxels();
+                            }
+
+                            readbackFrame++;
+                            if (readbackFrame >= Mathf.Max(1, gpuReadbackInterval) && !gpuSolver.IsGpuDepositReadbackPending)
+                            {
+                                readbackFrame = 0;
+                                gpuSolver.RequestGpuDepositReadback(this);
+                            }
+                        }
+                        else
+                        {
+                            readbackFrame++;
+                            if (readbackFrame >= Mathf.Max(1, gpuReadbackInterval))
+                            {
+                                readbackFrame = 0;
+                                float readbackStartMs = Time.realtimeSinceStartup * 1000f;
+                                gpuSolver.DownloadGpuDeposits(this, gpuDepositedVoxels);
+                                LastGpuReadbackMs += Time.realtimeSinceStartup * 1000f - readbackStartMs;
+                                ProcessGpuDepositedVoxels();
+                            }
+                        }
+                    }
+                    else if (useAsyncGpuReadback && gpuSolver.SupportsAsyncReadback)
                     {
                         float readbackStartMs = Time.realtimeSinceStartup * 1000f;
                         bool completed = useGpuDepositCandidateReadback
@@ -890,7 +935,10 @@ namespace MeteoriteSPH3D
                     LastCpuSimulationMs += Time.realtimeSinceStartup * 1000f - cpuSimStartMs;
                 }
 
-                terrain.CoolVoxels(Time.deltaTime, coolingRate * 0.2f);
+                if (!UseGpuSimulation || !UseDirectGpuDepositionThisFrame() || coolVoxelsOnCpuDuringGpuSimulation)
+                {
+                    terrain.CoolVoxels(Time.deltaTime, coolingRate * 0.2f);
+                }
                 FlushPendingDepositsIfNeeded(false);
                 UploadDirtyTerrainIfDue();
             }
@@ -916,6 +964,57 @@ namespace MeteoriteSPH3D
             }
 
             LastControllerUpdateMs = Time.realtimeSinceStartup * 1000f - updateStartMs;
+        }
+
+
+
+        private bool UseDirectGpuDepositionThisFrame()
+        {
+            if (!UseGpuSimulation || !useGpuDirectDeposition) return false;
+            return !gpuDirectDepositionOnlyInTail || IsTailDepositModeActive();
+        }
+
+
+        private void ProcessGpuDepositedVoxels()
+        {
+            if (gpuDepositedVoxels.Count == 0) return;
+            if (terrain == null)
+            {
+                gpuDepositedVoxels.Clear();
+                return;
+            }
+
+            float startMs = Time.realtimeSinceStartup * 1000f;
+            int placed = 0;
+            for (int i = 0; i < gpuDepositedVoxels.Count; i++)
+            {
+                GPUSPH3DSolver.DepositedVoxel d = gpuDepositedVoxels[i];
+                if (!terrain.InBounds(d.x, d.y, d.z)) continue;
+                if (terrain.IsSolid(d.x, d.y, d.z)) continue;
+
+                float temp = Mathf.Max(1f, Mathf.Min(d.temperature, sculptRimTemperature));
+                terrain.SetSolid(d.x, d.y, d.z, true, temp, 0f, 0.1f, true);
+                placed++;
+            }
+
+            gpuDepositedVoxels.Clear();
+
+            if (placed > 0)
+            {
+                LastSolidifiedParticles += placed;
+                TotalSolidifiedParticles += placed;
+                terrainDirty = true;
+
+                // GPU already wrote these voxels and top-column values inside ApplyGpuDeposits.
+                // Do not upload the mirrored CPU cells back immediately; that would put the old
+                // CPU main-thread upload back into the hot path we just removed.
+                terrain.ClearGpuDirtyVoxels();
+                gpuTerrainDirty = false;
+                gpuTerrainDirtyFrames = 0;
+            }
+
+            LastSolidifyMs += Time.realtimeSinceStartup * 1000f - startMs;
+            TryCompactGpuParticles();
         }
 
 
@@ -1069,9 +1168,19 @@ namespace MeteoriteSPH3D
         {
             if (!UseGpuSimulation || !compactInactiveGpuParticles) return;
             if (gpuCompactCooldownRemaining > 0) return;
-            if (gpuSolver.EstimatedInactiveCount < Mathf.Max(1, gpuCompactMinInactiveCount)) return;
-            if (gpuSolver.EstimatedInactiveRatio < Mathf.Clamp01(gpuCompactInactiveRatio)) return;
-            if (gpuSolver.IsReadbackPending || gpuSolver.IsDepositCandidateReadbackPending) return;
+
+            bool tailMode = IsTailDepositModeActive();
+            if (tailMode)
+            {
+                if (gpuSolver.EstimatedInactiveCount < 64) return;
+            }
+            else
+            {
+                if (gpuSolver.EstimatedInactiveCount < Mathf.Max(1, gpuCompactMinInactiveCount)) return;
+                if (gpuSolver.EstimatedInactiveRatio < Mathf.Clamp01(gpuCompactInactiveRatio)) return;
+            }
+
+            if (gpuSolver.IsReadbackPending || gpuSolver.IsDepositCandidateReadbackPending || gpuSolver.IsGpuDepositReadbackPending) return;
 
             float compactStartMs = Time.realtimeSinceStartup * 1000f;
             gpuSolver.CompactActiveParticles(particles);
@@ -1205,6 +1314,7 @@ namespace MeteoriteSPH3D
                 gpuSolver.DownloadToParticles(particles);
                 LastGpuReadbackMs += Time.realtimeSinceStartup * 1000f - readbackStartMs;
                 pendingGpuDeactivateIndices.Clear();
+                gpuDepositedVoxels.Clear();
             }
 
             Vector3 impactNormal = useLocalVoxelNormalForImpact ? EstimateLocalVoxelNormal(hitPoint) : Vector3.up;

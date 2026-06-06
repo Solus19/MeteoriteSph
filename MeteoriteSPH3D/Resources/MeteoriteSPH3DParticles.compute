@@ -5,6 +5,8 @@
 #pragma kernel DeactivateParticles
 #pragma kernel ClearDepositCandidates
 #pragma kernel CollectDepositCandidates
+#pragma kernel ClearGpuDeposits
+#pragma kernel ApplyGpuDeposits
 
 struct Particle
 {
@@ -23,7 +25,8 @@ struct Particle
 };
 
 RWStructuredBuffer<Particle> _Particles;
-StructuredBuffer<int> _TerrainSolid;
+RWStructuredBuffer<int> _TerrainSolid;
+RWStructuredBuffer<int> _TerrainTopSolidY;
 RWStructuredBuffer<int> _CellCounts;
 RWStructuredBuffer<int> _CellItems;
 StructuredBuffer<int> _DeactivateIndices;
@@ -38,6 +41,16 @@ struct DepositCandidate
 
 RWStructuredBuffer<DepositCandidate> _DepositCandidates;
 RWStructuredBuffer<int> _DepositCandidateCounter;
+
+struct GpuDepositResult
+{
+    int4 cellParticleValid;
+    float4 temperatureFlags;
+};
+
+RWStructuredBuffer<GpuDepositResult> _GpuDepositResults;
+RWStructuredBuffer<int> _GpuDepositResultCounter;
+
 int _DepositCandidateCapacity;
 float _DepositMinAge;
 float _DepositMaxTemperature;
@@ -100,6 +113,18 @@ int3 ParticleCell(float3 p)
 int TerrainIndex(int3 c)
 {
     return c.x + c.y * _TerrainSize.x + c.z * _TerrainSize.x * _TerrainSize.y;
+}
+
+
+int TerrainColumnIndex(int x, int z)
+{
+    return x + z * _TerrainSize.x;
+}
+
+int TopSolidY(int x, int z)
+{
+    if (x < 0 || x >= _TerrainSize.x || z < 0 || z >= _TerrainSize.z) return -1;
+    return _TerrainTopSolidY[TerrainColumnIndex(x, z)];
 }
 
 bool TerrainSolid(int3 c)
@@ -459,4 +484,122 @@ void DeactivateParticles(uint3 id : SV_DispatchThreadID)
     p.temperature = 0.0;
     p.position = float3(-100000.0, -100000.0, -100000.0);
     _Particles[particleIndex] = p;
+}
+
+
+// Direct GPU-side deposition: exact visual terrain update is still mirrored to CPU
+// through _GpuDepositResults, but the expensive per-particle FindDepositCell scan no
+// longer runs on the Unity main thread.
+int _GpuDepositSearchRadiusCells;
+int _GpuDepositMaxRiseAboveNeighbours;
+float _GpuDepositMinAge;
+float _GpuDepositMaxTemperature;
+float _GpuDepositMaxSpeed;
+float _GpuDepositForcedAge;
+int _GpuDepositTailMode;
+int _GpuDepositResultCapacity;
+
+bool IsGpuDepositCandidate(Particle p)
+{
+    float speed = length(p.velocity);
+    bool tailMode = _GpuDepositTailMode != 0;
+    bool coldEnough = tailMode || p.temperature <= _GpuDepositMaxTemperature;
+    bool oldEnough = tailMode || p.age >= _GpuDepositMinAge;
+    bool slowEnough = tailMode || speed <= _GpuDepositMaxSpeed;
+    bool contactOrOld = tailMode || p.recentGroundContact > 0.0 || p.age >= _GpuDepositForcedAge;
+    return coldEnough && oldEnough && slowEnough && contactOrOld;
+}
+
+[numthreads(128, 1, 1)]
+void ClearGpuDeposits(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i == 0) _GpuDepositResultCounter[0] = 0;
+    if (i >= (uint)_GpuDepositResultCapacity) return;
+
+    GpuDepositResult r;
+    r.cellParticleValid = int4(0, 0, 0, -1);
+    r.temperatureFlags = float4(0.0, 0.0, 0.0, 0.0);
+    _GpuDepositResults[i] = r;
+}
+
+[numthreads(128, 1, 1)]
+void ApplyGpuDeposits(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_ActiveCount) return;
+
+    Particle p = _Particles[i];
+    if (p.active < 0.5) return;
+    if (!IsGpuDepositCandidate(p)) return;
+
+    int3 c0 = (int3)floor(p.position / max(_TerrainCellSize, 0.0001));
+    int radius = max(1, _GpuDepositSearchRadiusCells);
+    float bestScore = 1e20;
+    int bestX = -1;
+    int bestZ = -1;
+
+    [loop]
+    for (int dz = -radius; dz <= radius; dz++)
+    [loop]
+    for (int dx = -radius; dx <= radius; dx++)
+    {
+        int x = c0.x + dx;
+        int z = c0.z + dz;
+        if (x < 0 || x >= _TerrainSize.x || z < 0 || z >= _TerrainSize.z) continue;
+
+        float hdist = sqrt((float)(dx * dx + dz * dz));
+        if (hdist > (float)radius + 0.01) continue;
+
+        int top = TopSolidY(x, z);
+        if (top < 0 || top >= _TerrainSize.y - 1) continue;
+
+        int neighbourMax = max(max(TopSolidY(x + 1, z), TopSolidY(x - 1, z)), max(TopSolidY(x, z + 1), TopSolidY(x, z - 1)));
+        int y = top + 1;
+        if (neighbourMax >= 0 && y > neighbourMax + max(0, _GpuDepositMaxRiseAboveNeighbours)) continue;
+
+        float yCenter = ((float)y + 0.5) * _TerrainCellSize;
+        float verticalPenalty = abs(yCenter - p.position.y) * 0.35;
+        float upwardPenalty = max(0.0, yCenter - p.position.y) * 1.2;
+        float score = hdist * 2.25 + verticalPenalty + upwardPenalty;
+
+        if (score < bestScore)
+        {
+            bestScore = score;
+            bestX = x;
+            bestZ = z;
+        }
+    }
+
+    if (bestX < 0 || bestZ < 0) return;
+
+    int slot;
+    InterlockedAdd(_GpuDepositResultCounter[0], 1, slot);
+    if (slot < 0 || slot >= _GpuDepositResultCapacity) return;
+
+    int column = TerrainColumnIndex(bestX, bestZ);
+    int oldTop;
+    InterlockedAdd(_TerrainTopSolidY[column], 1, oldTop);
+    int yFinal = oldTop + 1;
+    if (yFinal < 0 || yFinal >= _TerrainSize.y)
+    {
+        // Extremely rare overflow: keep the particle alive rather than writing out of bounds.
+        int ignored;
+        InterlockedAdd(_TerrainTopSolidY[column], -1, ignored);
+        return;
+    }
+
+    int3 cell = int3(bestX, yFinal, bestZ);
+    _TerrainSolid[TerrainIndex(cell)] = 1;
+
+    GpuDepositResult r;
+    r.cellParticleValid = int4(bestX, yFinal, bestZ, (int)i);
+    r.temperatureFlags = float4(p.temperature, 1.0, 0.0, 1.0);
+    _GpuDepositResults[slot] = r;
+
+    p.active = 0.0;
+    p.velocity = float3(0.0, 0.0, 0.0);
+    p.temperature = 0.0;
+    p.position = float3(-100000.0, -100000.0, -100000.0);
+    _Particles[i] = p;
 }

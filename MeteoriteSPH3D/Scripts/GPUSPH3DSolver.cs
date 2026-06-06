@@ -33,27 +33,54 @@ namespace MeteoriteSPH3D
             public Vector4 contactMassIndexFlags;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct GpuDepositResult
+        {
+            public int x;
+            public int y;
+            public int z;
+            public int particleIndex;
+            public Vector4 temperatureFlags;
+        }
+
+        public struct DepositedVoxel
+        {
+            public int x;
+            public int y;
+            public int z;
+            public float temperature;
+            public int particleIndex;
+        }
+
         public ComputeBuffer ParticleBuffer { get { return particleBuffer; } }
         public int ActiveCount { get; private set; }
-        public bool IsReady { get { return compute != null && particleBuffer != null && terrainSolidBuffer != null; } }
+        public bool IsReady { get { return compute != null && particleBuffer != null && terrainSolidBuffer != null && terrainTopSolidYBuffer != null; } }
         public bool SupportsAsyncReadback { get { return SystemInfo.supportsAsyncGPUReadback; } }
         public bool IsReadbackPending { get { return readbackPending; } }
         public bool IsDepositCandidateReadbackPending { get { return depositCandidateReadbackPending; } }
+        public bool IsGpuDepositReadbackPending { get { return gpuDepositReadbackPending; } }
         public int EstimatedInactiveCount { get { return Mathf.Clamp(estimatedInactiveCount, 0, ActiveCount); } }
+        public int LiveActiveEstimate { get { return Mathf.Max(0, ActiveCount - EstimatedInactiveCount); } }
         public float EstimatedInactiveRatio { get { return ActiveCount > 0 ? Mathf.Clamp01((float)EstimatedInactiveCount / (float)ActiveCount) : 0f; } }
 
         private ComputeShader compute;
         private ComputeBuffer particleBuffer;
         private ComputeBuffer terrainSolidBuffer;
+        private ComputeBuffer terrainTopSolidYBuffer;
         private ComputeBuffer cellCountsBuffer;
         private ComputeBuffer cellItemsBuffer;
         private ComputeBuffer deactivateIndexBuffer;
         private ComputeBuffer depositCandidateBuffer;
         private ComputeBuffer depositCandidateCounterBuffer;
+        private ComputeBuffer gpuDepositResultBuffer;
+        private ComputeBuffer gpuDepositResultCounterBuffer;
 
         private GPUParticle[] particleCache;
         private DepositCandidate[] depositCandidateCache;
+        private GpuDepositResult[] gpuDepositResultCache;
         private int[] terrainSolidCache;
+        private int[] terrainTopSolidCache;
+        private int[] terrainDirtyColumnUploadIndices;
         private int[] terrainDirtyUploadIndices;
         private readonly List<int> terrainDirtyScratch = new List<int>(4096);
         private int[] deactivateIndexCache;
@@ -66,6 +93,9 @@ namespace MeteoriteSPH3D
         private bool depositCandidateReadbackPending;
         private AsyncGPUReadbackRequest depositCandidateReadbackRequest;
         private int depositCandidateReadbackUploadVersion;
+        private bool gpuDepositReadbackPending;
+        private AsyncGPUReadbackRequest gpuDepositReadbackRequest;
+        private int gpuDepositReadbackUploadVersion;
         private int uploadVersion;
 
         private int maxParticles;
@@ -83,6 +113,8 @@ namespace MeteoriteSPH3D
         private int kDeactivate;
         private int kClearDepositCandidates;
         private int kCollectDepositCandidates;
+        private int kClearGpuDeposits;
+        private int kApplyGpuDeposits;
 
         public void Initialize(MeteoriteSPH3DController c, VoxelTerrain3D terrain)
         {
@@ -107,13 +139,17 @@ namespace MeteoriteSPH3D
 
             particleCache = new GPUParticle[maxParticles];
             depositCandidateCache = new DepositCandidate[maxDepositCandidates];
+            gpuDepositResultCache = new GpuDepositResult[maxDepositCandidates];
             particleBuffer = new ComputeBuffer(maxParticles, Marshal.SizeOf(typeof(GPUParticle)), ComputeBufferType.Structured);
             terrainSolidBuffer = new ComputeBuffer(terrain.Width * terrain.Height * terrain.Depth, sizeof(int), ComputeBufferType.Structured);
+            terrainTopSolidYBuffer = new ComputeBuffer(terrain.Width * terrain.Depth, sizeof(int), ComputeBufferType.Structured);
             cellCountsBuffer = new ComputeBuffer(gridCellCount, sizeof(int), ComputeBufferType.Structured);
             cellItemsBuffer = new ComputeBuffer(gridCellCount * maxPerCell, sizeof(int), ComputeBufferType.Structured);
             deactivateIndexBuffer = new ComputeBuffer(maxParticles, sizeof(int), ComputeBufferType.Structured);
             depositCandidateBuffer = new ComputeBuffer(maxDepositCandidates, Marshal.SizeOf(typeof(DepositCandidate)), ComputeBufferType.Structured);
             depositCandidateCounterBuffer = new ComputeBuffer(1, sizeof(int), ComputeBufferType.Structured);
+            gpuDepositResultBuffer = new ComputeBuffer(maxDepositCandidates, Marshal.SizeOf(typeof(GpuDepositResult)), ComputeBufferType.Structured);
+            gpuDepositResultCounterBuffer = new ComputeBuffer(1, sizeof(int), ComputeBufferType.Structured);
             deactivateIndexCache = new int[maxParticles];
 
             kClear = compute.FindKernel("ClearGrid");
@@ -123,6 +159,8 @@ namespace MeteoriteSPH3D
             kDeactivate = compute.FindKernel("DeactivateParticles");
             kClearDepositCandidates = compute.FindKernel("ClearDepositCandidates");
             kCollectDepositCandidates = compute.FindKernel("CollectDepositCandidates");
+            kClearGpuDeposits = compute.FindKernel("ClearGpuDeposits");
+            kApplyGpuDeposits = compute.FindKernel("ApplyGpuDeposits");
 
             BindBuffers(kClear);
             BindBuffers(kBuild);
@@ -131,11 +169,17 @@ namespace MeteoriteSPH3D
             BindBuffers(kDeactivate);
             BindBuffers(kClearDepositCandidates);
             BindBuffers(kCollectDepositCandidates);
+            BindBuffers(kClearGpuDeposits);
+            BindBuffers(kApplyGpuDeposits);
             compute.SetBuffer(kDeactivate, "_DeactivateIndices", deactivateIndexBuffer);
             compute.SetBuffer(kClearDepositCandidates, "_DepositCandidates", depositCandidateBuffer);
             compute.SetBuffer(kClearDepositCandidates, "_DepositCandidateCounter", depositCandidateCounterBuffer);
             compute.SetBuffer(kCollectDepositCandidates, "_DepositCandidates", depositCandidateBuffer);
             compute.SetBuffer(kCollectDepositCandidates, "_DepositCandidateCounter", depositCandidateCounterBuffer);
+            compute.SetBuffer(kClearGpuDeposits, "_GpuDepositResults", gpuDepositResultBuffer);
+            compute.SetBuffer(kClearGpuDeposits, "_GpuDepositResultCounter", gpuDepositResultCounterBuffer);
+            compute.SetBuffer(kApplyGpuDeposits, "_GpuDepositResults", gpuDepositResultBuffer);
+            compute.SetBuffer(kApplyGpuDeposits, "_GpuDepositResultCounter", gpuDepositResultCounterBuffer);
 
             compute.SetInts("_GridSize", gridX, gridY, gridZ);
             compute.SetInt("_GridCellCount", gridCellCount);
@@ -152,30 +196,41 @@ namespace MeteoriteSPH3D
         {
             if (particleBuffer != null) particleBuffer.Release();
             if (terrainSolidBuffer != null) terrainSolidBuffer.Release();
+            if (terrainTopSolidYBuffer != null) terrainTopSolidYBuffer.Release();
             if (cellCountsBuffer != null) cellCountsBuffer.Release();
             if (cellItemsBuffer != null) cellItemsBuffer.Release();
             if (deactivateIndexBuffer != null) deactivateIndexBuffer.Release();
             if (depositCandidateBuffer != null) depositCandidateBuffer.Release();
             if (depositCandidateCounterBuffer != null) depositCandidateCounterBuffer.Release();
+            if (gpuDepositResultBuffer != null) gpuDepositResultBuffer.Release();
+            if (gpuDepositResultCounterBuffer != null) gpuDepositResultCounterBuffer.Release();
             particleBuffer = null;
             terrainSolidBuffer = null;
+            terrainTopSolidYBuffer = null;
             cellCountsBuffer = null;
             cellItemsBuffer = null;
             deactivateIndexBuffer = null;
             depositCandidateBuffer = null;
             depositCandidateCounterBuffer = null;
+            gpuDepositResultBuffer = null;
+            gpuDepositResultCounterBuffer = null;
             compute = null;
             particleCache = null;
             depositCandidateCache = null;
+            gpuDepositResultCache = null;
             terrainSolidCache = null;
+            terrainTopSolidCache = null;
+            terrainDirtyColumnUploadIndices = null;
             terrainDirtyUploadIndices = null;
             terrainDirtyScratch.Clear();
             deactivateIndexCache = null;
             readbackPending = false;
             depositCandidateReadbackPending = false;
+            gpuDepositReadbackPending = false;
             readbackCount = 0;
             readbackUploadVersion = 0;
             depositCandidateReadbackUploadVersion = 0;
+            gpuDepositReadbackUploadVersion = 0;
             uploadVersion++;
             estimatedInactiveCount = 0;
             ActiveCount = 0;
@@ -185,6 +240,7 @@ namespace MeteoriteSPH3D
         {
             compute.SetBuffer(kernel, "_Particles", particleBuffer);
             compute.SetBuffer(kernel, "_TerrainSolid", terrainSolidBuffer);
+            compute.SetBuffer(kernel, "_TerrainTopSolidY", terrainTopSolidYBuffer);
             compute.SetBuffer(kernel, "_CellCounts", cellCountsBuffer);
             compute.SetBuffer(kernel, "_CellItems", cellItemsBuffer);
         }
@@ -209,6 +265,17 @@ namespace MeteoriteSPH3D
                 }
             }
             terrainSolidBuffer.SetData(terrainSolidCache);
+
+            EnsureTerrainTopSolidUploadCache(terrain.Width * terrain.Depth);
+            for (int z = 0; z < terrain.Depth; z++)
+            {
+                for (int x = 0; x < terrain.Width; x++)
+                {
+                    terrainTopSolidCache[x + z * terrain.Width] = terrain.TopSolidY(x, z);
+                }
+            }
+            if (terrainTopSolidYBuffer != null) terrainTopSolidYBuffer.SetData(terrainTopSolidCache);
+
             terrain.ClearGpuDirtyVoxels();
         }
 
@@ -238,8 +305,13 @@ namespace MeteoriteSPH3D
 
             if (terrainDirtyUploadIndices == null || terrainDirtyUploadIndices.Length < terrainDirtyScratch.Count)
                 terrainDirtyUploadIndices = new int[Mathf.NextPowerOfTwo(terrainDirtyScratch.Count)];
+            if (terrainDirtyColumnUploadIndices == null || terrainDirtyColumnUploadIndices.Length < terrainDirtyScratch.Count)
+                terrainDirtyColumnUploadIndices = new int[Mathf.NextPowerOfTwo(terrainDirtyScratch.Count)];
+
+            EnsureTerrainTopSolidUploadCache(terrain.Width * terrain.Depth);
 
             int count = 0;
+            int columnCount = 0;
             for (int i = 0; i < terrainDirtyScratch.Count; i++)
             {
                 int terrainIndex = terrainDirtyScratch[i];
@@ -252,35 +324,66 @@ namespace MeteoriteSPH3D
 
                 terrainSolidCache[computeIndex] = terrain.IsSolid(x, y, z) ? 1 : 0;
                 terrainDirtyUploadIndices[count++] = computeIndex;
+
+                int column = x + z * terrain.Width;
+                terrainTopSolidCache[column] = terrain.TopSolidY(x, z);
+                terrainDirtyColumnUploadIndices[columnCount++] = column;
             }
 
             terrainDirtyScratch.Clear();
-            if (count <= 0) return;
 
-            System.Array.Sort(terrainDirtyUploadIndices, 0, count);
-
-            int runStart = terrainDirtyUploadIndices[0];
-            int runEnd = runStart;
-            for (int i = 1; i < count; i++)
+            if (count > 0)
             {
-                int index = terrainDirtyUploadIndices[i];
-                if (index <= runEnd) continue; // ignore accidental duplicates
-                // Merge short gaps too: uploading a few unchanged ints is cheaper than many tiny GPU SetData calls.
-                if (index <= runEnd + 32)
-                {
-                    runEnd = index;
-                    continue;
-                }
+                System.Array.Sort(terrainDirtyUploadIndices, 0, count);
 
+                int runStart = terrainDirtyUploadIndices[0];
+                int runEnd = runStart;
+                for (int i = 1; i < count; i++)
+                {
+                    int index = terrainDirtyUploadIndices[i];
+                    if (index <= runEnd) continue; // ignore accidental duplicates
+                    // Merge short gaps too: uploading a few unchanged ints is cheaper than many tiny GPU SetData calls.
+                    if (index <= runEnd + 32)
+                    {
+                        runEnd = index;
+                        continue;
+                    }
+
+                    UploadTerrainRun(runStart, runEnd);
+                    runStart = runEnd = index;
+                }
                 UploadTerrainRun(runStart, runEnd);
-                runStart = runEnd = index;
             }
-            UploadTerrainRun(runStart, runEnd);
+
+            if (columnCount > 0)
+            {
+                System.Array.Sort(terrainDirtyColumnUploadIndices, 0, columnCount);
+                int runStart = terrainDirtyColumnUploadIndices[0];
+                int runEnd = runStart;
+                for (int i = 1; i < columnCount; i++)
+                {
+                    int index = terrainDirtyColumnUploadIndices[i];
+                    if (index <= runEnd) continue;
+                    if (index <= runEnd + 16)
+                    {
+                        runEnd = index;
+                        continue;
+                    }
+                    UploadTerrainTopSolidRun(runStart, runEnd);
+                    runStart = runEnd = index;
+                }
+                UploadTerrainTopSolidRun(runStart, runEnd);
+            }
         }
 
         private void EnsureTerrainUploadCache(int n)
         {
             if (terrainSolidCache == null || terrainSolidCache.Length != n) terrainSolidCache = new int[n];
+        }
+
+        private void EnsureTerrainTopSolidUploadCache(int n)
+        {
+            if (terrainTopSolidCache == null || terrainTopSolidCache.Length != n) terrainTopSolidCache = new int[n];
         }
 
         private static int TerrainComputeIndex(VoxelTerrain3D terrain, int x, int y, int z)
@@ -293,6 +396,14 @@ namespace MeteoriteSPH3D
             int count = runEnd - runStart + 1;
             if (count <= 0) return;
             terrainSolidBuffer.SetData(terrainSolidCache, runStart, runStart, count);
+        }
+
+        private void UploadTerrainTopSolidRun(int runStart, int runEnd)
+        {
+            if (terrainTopSolidYBuffer == null || terrainTopSolidCache == null) return;
+            int count = runEnd - runStart + 1;
+            if (count <= 0) return;
+            terrainTopSolidYBuffer.SetData(terrainTopSolidCache, runStart, runStart, count);
         }
 
         public void UploadFromParticles(List<SPHParticle3D> particles)
@@ -332,6 +443,7 @@ namespace MeteoriteSPH3D
             particleBuffer.SetData(particleCache);
             readbackPending = false;
             depositCandidateReadbackPending = false;
+            gpuDepositReadbackPending = false;
             uploadVersion++;
             estimatedInactiveCount = 0;
         }
@@ -390,11 +502,13 @@ namespace MeteoriteSPH3D
                 particles.Clear();
                 readbackPending = false;
                 depositCandidateReadbackPending = false;
+                gpuDepositReadbackPending = false;
                 return;
             }
 
             readbackPending = false;
             depositCandidateReadbackPending = false;
+            gpuDepositReadbackPending = false;
             particleBuffer.GetData(particleCache, 0, 0, ActiveCount);
             particles.Clear();
             for (int i = 0; i < ActiveCount; i++)
@@ -510,6 +624,116 @@ namespace MeteoriteSPH3D
             }
         }
 
+        private void DispatchGpuDeposition(MeteoriteSPH3DController c)
+        {
+            if (!IsReady || gpuDepositResultBuffer == null || gpuDepositResultCounterBuffer == null || ActiveCount <= 0) return;
+
+            bool tailDepositMode = c.IsTailDepositModeActive();
+            float maxTempBonus = Mathf.Max(0f, c.centerCaptureTemperatureBonus, c.rimCaptureTemperatureBonus, c.forceDepositTemperatureBonus);
+            float maxDepositTemperature = tailDepositMode ? 1000000f : c.solidifyTemperature + maxTempBonus;
+            float maxDepositSpeed = tailDepositMode ? 1000000f : Mathf.Max(c.solidifySpeed, c.centerCaptureMaxSpeed, c.rimCaptureMaxSpeed, c.forceDepositMaxSpeed * 2.5f);
+            float forcedAge = tailDepositMode ? 0f : (c.forceDepositOldParticles ? c.forceDepositAge : 999999f);
+            float minAge = tailDepositMode ? 0f : Mathf.Min(c.solidifyMinAge, c.centerCaptureMinAge, c.rimCaptureMinAge, forcedAge);
+
+            int searchRadius = tailDepositMode
+                ? Mathf.Max(c.depositSearchRadiusCells, c.forcedDepositSearchRadiusCells)
+                : c.depositSearchRadiusCells;
+            int riseLimit = tailDepositMode
+                ? Mathf.Max(c.maxDepositRiseAboveNeighbours, 2)
+                : Mathf.Max(0, c.maxDepositRiseAboveNeighbours);
+
+            compute.SetInt("_ActiveCount", ActiveCount);
+            compute.SetInt("_GpuDepositResultCapacity", maxDepositCandidates);
+            compute.SetInt("_GpuDepositSearchRadiusCells", Mathf.Clamp(searchRadius, 1, 12));
+            compute.SetInt("_GpuDepositMaxRiseAboveNeighbours", Mathf.Clamp(riseLimit, 0, 16));
+            compute.SetInt("_GpuDepositTailMode", tailDepositMode ? 1 : 0);
+            compute.SetFloat("_GpuDepositMinAge", minAge);
+            compute.SetFloat("_GpuDepositMaxTemperature", maxDepositTemperature);
+            compute.SetFloat("_GpuDepositMaxSpeed", Mathf.Max(0.01f, maxDepositSpeed));
+            compute.SetFloat("_GpuDepositForcedAge", forcedAge);
+
+            int groupsResults = Mathf.CeilToInt(maxDepositCandidates / 128f);
+            compute.Dispatch(kClearGpuDeposits, groupsResults, 1, 1);
+
+            int groupsParticles = Mathf.CeilToInt(ActiveCount / 128f);
+            compute.Dispatch(kApplyGpuDeposits, groupsParticles, 1, 1);
+        }
+
+        public bool RequestGpuDepositReadback(MeteoriteSPH3DController c)
+        {
+            if (!SupportsAsyncReadback || !IsReady || ActiveCount <= 0 || gpuDepositReadbackPending) return false;
+            DispatchGpuDeposition(c);
+            gpuDepositReadbackUploadVersion = uploadVersion;
+            gpuDepositReadbackRequest = AsyncGPUReadback.Request(gpuDepositResultBuffer);
+            gpuDepositReadbackPending = true;
+            return true;
+        }
+
+        public bool TryConsumeGpuDepositReadback(List<DepositedVoxel> results)
+        {
+            if (!gpuDepositReadbackPending) return false;
+            if (!gpuDepositReadbackRequest.done) return false;
+
+            gpuDepositReadbackPending = false;
+            if (results == null) return false;
+            results.Clear();
+
+            if (gpuDepositReadbackRequest.hasError || gpuDepositReadbackUploadVersion != uploadVersion)
+            {
+                return false;
+            }
+
+            NativeArray<GpuDepositResult> data = gpuDepositReadbackRequest.GetData<GpuDepositResult>();
+            int count = Mathf.Min(maxDepositCandidates, data.Length);
+            for (int i = 0; i < count; i++)
+            {
+                GpuDepositResult r = data[i];
+                if (r.temperatureFlags.w < 0.5f) continue;
+                if (r.x < 0 || r.y < 0 || r.z < 0) continue;
+
+                DepositedVoxel d = new DepositedVoxel
+                {
+                    x = r.x,
+                    y = r.y,
+                    z = r.z,
+                    temperature = r.temperatureFlags.x,
+                    particleIndex = r.particleIndex
+                };
+                results.Add(d);
+            }
+
+            if (results.Count > 0) estimatedInactiveCount = Mathf.Min(ActiveCount, estimatedInactiveCount + results.Count);
+            return true;
+        }
+
+        public void DownloadGpuDeposits(MeteoriteSPH3DController c, List<DepositedVoxel> results)
+        {
+            if (!IsReady || gpuDepositResultBuffer == null || gpuDepositResultCache == null || results == null) return;
+            gpuDepositReadbackPending = false;
+            DispatchGpuDeposition(c);
+            gpuDepositResultBuffer.GetData(gpuDepositResultCache, 0, 0, maxDepositCandidates);
+
+            results.Clear();
+            for (int i = 0; i < maxDepositCandidates; i++)
+            {
+                GpuDepositResult r = gpuDepositResultCache[i];
+                if (r.temperatureFlags.w < 0.5f) continue;
+                if (r.x < 0 || r.y < 0 || r.z < 0) continue;
+
+                DepositedVoxel d = new DepositedVoxel
+                {
+                    x = r.x,
+                    y = r.y,
+                    z = r.z,
+                    temperature = r.temperatureFlags.x,
+                    particleIndex = r.particleIndex
+                };
+                results.Add(d);
+            }
+
+            if (results.Count > 0) estimatedInactiveCount = Mathf.Min(ActiveCount, estimatedInactiveCount + results.Count);
+        }
+
 
         public void CompactActiveParticles(List<SPHParticle3D> particles)
         {
@@ -520,11 +744,13 @@ namespace MeteoriteSPH3D
                 estimatedInactiveCount = 0;
                 readbackPending = false;
                 depositCandidateReadbackPending = false;
+                gpuDepositReadbackPending = false;
                 return;
             }
 
             readbackPending = false;
             depositCandidateReadbackPending = false;
+            gpuDepositReadbackPending = false;
             particleBuffer.GetData(particleCache, 0, 0, ActiveCount);
             particles.Clear();
             for (int i = 0; i < ActiveCount; i++)

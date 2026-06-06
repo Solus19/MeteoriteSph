@@ -81,10 +81,10 @@ namespace MeteoriteSPH3D
 
         private void DrawGpu(MeteoriteSPH3DController c)
         {
-            if (sphereMesh == null || gpuMaterial == null || argsBuffer == null || c.ActiveParticleCount <= 0) return;
+            if (sphereMesh == null || gpuMaterial == null || argsBuffer == null || c.GpuParticleDrawCount <= 0) return;
 
             args[0] = sphereMesh.GetIndexCount(0);
-            args[1] = (uint)c.ActiveParticleCount;
+            args[1] = (uint)c.GpuParticleDrawCount;
             args[2] = sphereMesh.GetIndexStart(0);
             args[3] = sphereMesh.GetBaseVertex(0);
             args[4] = 0;

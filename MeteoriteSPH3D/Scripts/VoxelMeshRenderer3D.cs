@@ -57,6 +57,7 @@ namespace MeteoriteSPH3D
         private int cachedHeight;
         private int cachedDepth;
         private int cachedChunkSize;
+        private bool cachedHeightfield2DChunks;
         private bool builtAtLeastOnce;
         private int fullRebuildSerial;
 
@@ -193,11 +194,14 @@ namespace MeteoriteSPH3D
         private void EnsureChunks(VoxelTerrain3D terrain)
         {
             int size = Mathf.Clamp(chunkSize, 4, 64);
+            MeteoriteSPH3DController controller = MeteoriteSPH3DController.Instance;
+            bool heightfield2DChunks = useHeightfieldMeshing && (controller == null || !controller.layerViewEnabled);
             bool needsRecreate = chunks == null
                                  || cachedWidth != terrain.Width
                                  || cachedHeight != terrain.Height
                                  || cachedDepth != terrain.Depth
-                                 || cachedChunkSize != size;
+                                 || cachedChunkSize != size
+                                 || cachedHeightfield2DChunks != heightfield2DChunks;
             if (!needsRecreate) return;
 
             DestroyChunks();
@@ -206,8 +210,9 @@ namespace MeteoriteSPH3D
             cachedHeight = terrain.Height;
             cachedDepth = terrain.Depth;
             cachedChunkSize = size;
+            cachedHeightfield2DChunks = heightfield2DChunks;
             chunkGridX = Mathf.CeilToInt(terrain.Width / (float)size);
-            chunkGridY = Mathf.CeilToInt(terrain.Height / (float)size);
+            chunkGridY = heightfield2DChunks ? 1 : Mathf.CeilToInt(terrain.Height / (float)size);
             chunkGridZ = Mathf.CeilToInt(terrain.Depth / (float)size);
 
             int count = chunkGridX * chunkGridY * chunkGridZ;
@@ -298,12 +303,12 @@ namespace MeteoriteSPH3D
             maxY = Mathf.Clamp(maxY, 0, cachedHeight - 1);
             maxZ = Mathf.Clamp(maxZ, 0, cachedDepth - 1);
 
-            int cMinX = minX / cachedChunkSize;
-            int cMinY = minY / cachedChunkSize;
-            int cMinZ = minZ / cachedChunkSize;
-            int cMaxX = maxX / cachedChunkSize;
-            int cMaxY = maxY / cachedChunkSize;
-            int cMaxZ = maxZ / cachedChunkSize;
+            int cMinX = Mathf.Clamp(minX / cachedChunkSize, 0, chunkGridX - 1);
+            int cMinY = Mathf.Clamp(minY / cachedChunkSize, 0, chunkGridY - 1);
+            int cMinZ = Mathf.Clamp(minZ / cachedChunkSize, 0, chunkGridZ - 1);
+            int cMaxX = Mathf.Clamp(maxX / cachedChunkSize, 0, chunkGridX - 1);
+            int cMaxY = Mathf.Clamp(maxY / cachedChunkSize, 0, chunkGridY - 1);
+            int cMaxZ = Mathf.Clamp(maxZ / cachedChunkSize, 0, chunkGridZ - 1);
 
             for (int cy = cMinY; cy <= cMaxY; cy++)
             {
@@ -419,10 +424,10 @@ namespace MeteoriteSPH3D
             uvs.Clear();
 
             int x0 = chunk.cx * cachedChunkSize;
-            int y0 = chunk.cy * cachedChunkSize;
+            int y0 = cachedHeightfield2DChunks ? 0 : chunk.cy * cachedChunkSize;
             int z0 = chunk.cz * cachedChunkSize;
             int x1 = Mathf.Min(x0 + cachedChunkSize, terrain.Width);
-            int y1 = Mathf.Min(y0 + cachedChunkSize, terrain.Height);
+            int y1 = cachedHeightfield2DChunks ? terrain.Height : Mathf.Min(y0 + cachedChunkSize, terrain.Height);
             int z1 = Mathf.Min(z0 + cachedChunkSize, terrain.Depth);
             float s = terrain.CellSize;
             MeteoriteSPH3DController controller = MeteoriteSPH3DController.Instance;
