@@ -15,9 +15,21 @@ namespace MeteoriteSPH3D
 
             if (key == KeyCode.R) return keyboard.rKey.wasPressedThisFrame;
             if (key == KeyCode.S) return keyboard.sKey.wasPressedThisFrame;
+            if (key == KeyCode.B) return keyboard.bKey.wasPressedThisFrame;
             if (key == KeyCode.Space) return keyboard.spaceKey.wasPressedThisFrame;
             if (key == KeyCode.M) return keyboard.mKey.wasPressedThisFrame;
             if (key == KeyCode.F1) return keyboard.f1Key.wasPressedThisFrame;
+            if (key == KeyCode.F2) return keyboard.f2Key.wasPressedThisFrame;
+            if (key == KeyCode.F3) return keyboard.f3Key.wasPressedThisFrame;
+            if (key == KeyCode.F4) return keyboard.f4Key.wasPressedThisFrame;
+            if (key == KeyCode.F5) return keyboard.f5Key.wasPressedThisFrame;
+            if (key == KeyCode.F6) return keyboard.f6Key.wasPressedThisFrame;
+            if (key == KeyCode.F7) return keyboard.f7Key.wasPressedThisFrame;
+            if (key == KeyCode.F8) return keyboard.f8Key.wasPressedThisFrame;
+            if (key == KeyCode.F9) return keyboard.f9Key.wasPressedThisFrame;
+            if (key == KeyCode.F10) return keyboard.f10Key.wasPressedThisFrame;
+            if (key == KeyCode.F11) return keyboard.f11Key.wasPressedThisFrame;
+            if (key == KeyCode.F12) return keyboard.f12Key.wasPressedThisFrame;
             if (key == KeyCode.LeftShift || key == KeyCode.RightShift)
                 return keyboard.leftShiftKey.wasPressedThisFrame || keyboard.rightShiftKey.wasPressedThisFrame;
             return false;
@@ -34,6 +46,23 @@ namespace MeteoriteSPH3D
             Keyboard keyboard = Keyboard.current;
             if (keyboard == null) return false;
 
+            if (key == KeyCode.R) return keyboard.rKey.isPressed;
+            if (key == KeyCode.S) return keyboard.sKey.isPressed;
+            if (key == KeyCode.B) return keyboard.bKey.isPressed;
+            if (key == KeyCode.Space) return keyboard.spaceKey.isPressed;
+            if (key == KeyCode.M) return keyboard.mKey.isPressed;
+            if (key == KeyCode.F1) return keyboard.f1Key.isPressed;
+            if (key == KeyCode.F2) return keyboard.f2Key.isPressed;
+            if (key == KeyCode.F3) return keyboard.f3Key.isPressed;
+            if (key == KeyCode.F4) return keyboard.f4Key.isPressed;
+            if (key == KeyCode.F5) return keyboard.f5Key.isPressed;
+            if (key == KeyCode.F6) return keyboard.f6Key.isPressed;
+            if (key == KeyCode.F7) return keyboard.f7Key.isPressed;
+            if (key == KeyCode.F8) return keyboard.f8Key.isPressed;
+            if (key == KeyCode.F9) return keyboard.f9Key.isPressed;
+            if (key == KeyCode.F10) return keyboard.f10Key.isPressed;
+            if (key == KeyCode.F11) return keyboard.f11Key.isPressed;
+            if (key == KeyCode.F12) return keyboard.f12Key.isPressed;
             if (key == KeyCode.LeftShift || key == KeyCode.RightShift)
                 return keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed;
             return false;

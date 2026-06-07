@@ -353,6 +353,76 @@ namespace MeteoriteSPH3D
             }
         }
 
+
+        public void ReplaceSolidStateFromGpuBuffers(int[] computeOrderSolid, int[] gpuTopSolidY, bool markNewSolidsAsDeposited)
+        {
+            int expectedSolid = Width * Height * Depth;
+            int expectedTop = Width * Depth;
+            if (computeOrderSolid == null || computeOrderSolid.Length < expectedSolid) return;
+            if (gpuTopSolidY == null || gpuTopSolidY.Length < expectedTop) return;
+
+            ClearThermalState();
+            SolidCount = 0;
+            for (int i = 0; i < topSolidYByColumn.Length; i++) topSolidYByColumn[i] = -1;
+
+            int src = 0;
+            for (int z = 0; z < Depth; z++)
+            {
+                for (int y = 0; y < Height; y++)
+                {
+                    for (int x = 0; x < Width; x++)
+                    {
+                        int dst = Index(x, y, z);
+                        VoxelCell3D old = Cells[dst];
+                        bool wasSolid = old.solid;
+                        bool solid = computeOrderSolid[src++] != 0;
+
+                        if (solid)
+                        {
+                            VoxelCell3D cell = old;
+                            cell.solid = true;
+                            cell.pressure = 0f;
+                            cell.damage = Mathf.Clamp01(cell.damage);
+
+                            if (!wasSolid && markNewSolidsAsDeposited)
+                            {
+                                cell.temperature = Mathf.Max(1f, cell.temperature);
+                                cell.damage = Mathf.Max(cell.damage, 0.1f);
+                                cell.deposited = true;
+                            }
+
+                            Cells[dst] = cell;
+                            SolidCount++;
+                            int column = ColumnIndex(x, z);
+                            if (y > topSolidYByColumn[column]) topSolidYByColumn[column] = y;
+                        }
+                        else
+                        {
+                            Cells[dst] = new VoxelCell3D
+                            {
+                                solid = false,
+                                temperature = 0f,
+                                pressure = 0f,
+                                damage = 0f,
+                                deposited = false
+                            };
+                        }
+                    }
+                }
+            }
+
+            // Prefer the GPU top cache when it is valid, but recomputed values above keep us safe
+            // if the GPU buffer contains an out-of-range value after an overflow guard.
+            for (int i = 0; i < expectedTop && i < topSolidYByColumn.Length; i++)
+            {
+                int top = gpuTopSolidY[i];
+                if (top >= -1 && top < Height) topSolidYByColumn[i] = top;
+            }
+
+            MarkAllDirty();
+            ClearGpuDirtyVoxels();
+        }
+
         public void MarkAllDirty()
         {
             ClearDirtyVoxelQueue();

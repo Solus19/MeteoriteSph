@@ -10,7 +10,7 @@ namespace MeteoriteSPH3D
     public sealed class MeteoriteSPH3DBenchmark : MonoBehaviour
     {
         [Header("CSV benchmark")]
-        public bool recordOnStart = true;
+        public bool recordOnStart = false;
         public float sampleInterval = 0.25f;
         public int flushEverySamples = 16;
         public KeyCode toggleRecordingKey = KeyCode.B;
