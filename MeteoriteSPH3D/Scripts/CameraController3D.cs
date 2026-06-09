@@ -52,7 +52,7 @@ namespace MeteoriteSPH3D
 
             if (InputBridge3D.KeyDown(KeyCode.F))
             {
-                target = new Vector3(MeteoriteSPH3DController.Instance.terrainWidth * MeteoriteSPH3DController.Instance.cellSize * 0.5f, MeteoriteSPH3DController.Instance.terrainHeight * MeteoriteSPH3DController.Instance.cellSize * 0.25f, MeteoriteSPH3DController.Instance.terrainDepth * MeteoriteSPH3DController.Instance.cellSize * 0.5f);
+                target = MeteoriteSPH3DController.Instance.GetDefaultCameraTarget();
             }
 
             UpdateTransform();

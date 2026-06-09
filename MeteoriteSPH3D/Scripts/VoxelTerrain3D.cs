@@ -215,26 +215,27 @@ namespace MeteoriteSPH3D
                     float dz = (z - cz) * invMax;
                     float radial = Mathf.Sqrt(dx * dx + dz * dz);
 
-                    float dome = Mathf.Clamp01(1f - radial * 0.92f);
-                    dome = dome * dome * (3f - 2f * dome);
-                    float cone = Mathf.Clamp01(1f - radial * 1.05f);
-                    float peak = Mathf.Clamp01(1f - radial * 1.85f);
-                    peak *= peak;
-                    float shoulder = Mathf.Clamp01(1f - radial * 0.62f);
+                    // One large central mountain: high in the middle, smoothly fading to the base plane near the map edges.
+                    // Noise is deliberately weak and slope-masked, so the level reads as a mountain, not random bumpy terrain.
+                    float foot = Mathf.Clamp01(1f - radial / 0.98f);
+                    float dome = foot * foot * (3f - 2f * foot);
+                    float shoulder = Mathf.Pow(Mathf.Clamp01(1f - radial / 0.72f), 1.65f);
+                    float peak = Mathf.Pow(Mathf.Clamp01(1f - radial / 0.36f), 1.35f);
 
                     float n1 = Mathf.PerlinNoise(nx + seedA, nz + seedB) - 0.5f;
-                    float n2 = Mathf.PerlinNoise(nx * 1.9f + seedB * 0.37f, nz * 1.9f + seedA * 0.37f) - 0.5f;
-                    float ridge = 1f - Mathf.Abs(Mathf.PerlinNoise(nx * 1.25f + seedA * 0.21f, nz * 1.25f + seedB * 0.21f) * 2f - 1f);
+                    float n2 = Mathf.PerlinNoise(nx * 2.1f + seedB * 0.37f, nz * 2.1f + seedA * 0.37f) - 0.5f;
+                    float ridge = 1f - Mathf.Abs(Mathf.PerlinNoise(nx * 1.35f + seedA * 0.21f, nz * 1.35f + seedB * 0.21f) * 2f - 1f);
                     ridge *= ridge;
 
-                    float slopeNoise = n1 * amplitudeCells * 0.28f + n2 * amplitudeCells * 0.12f;
-                    float summitNoise = ridge * amplitudeCells * 0.22f * Mathf.Clamp01(1f - radial * 1.2f);
+                    float slopeMask = Mathf.Clamp01(1f - radial / 0.95f) * Mathf.Clamp01(radial * 2.8f);
+                    float summitMask = Mathf.Clamp01(1f - radial / 0.42f);
+                    float slopeNoise = (n1 * 0.12f + n2 * 0.06f) * amplitudeCells * slopeMask;
+                    float summitNoise = ridge * amplitudeCells * 0.08f * summitMask;
 
                     float h = baseHeight
-                              + shoulder * amplitudeCells * 0.28f
-                              + dome * amplitudeCells * 1.10f
-                              + cone * amplitudeCells * 0.72f
-                              + peak * amplitudeCells * 0.42f
+                              + dome * amplitudeCells * 0.72f
+                              + shoulder * amplitudeCells * 0.20f
+                              + peak * amplitudeCells * 0.14f
                               + slopeNoise
                               + summitNoise;
 

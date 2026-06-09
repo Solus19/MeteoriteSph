@@ -34,7 +34,7 @@ namespace MeteoriteSPH3D
         public int terrainDepth = 240;
         public float cellSize = 0.35f;
         public int baseHeight = 24;
-        public bool useReliefTerrain = false;
+        public bool useReliefTerrain = true;
         public int reliefAmplitudeCells = 44;
         public float reliefNoiseScale = 0.085f;
         public int reliefSeed = 23;
@@ -384,7 +384,7 @@ namespace MeteoriteSPH3D
             camGo.tag = "MainCamera";
             cameraController = camGo.AddComponent<CameraController3D>();
             float cameraDistance = Mathf.Max(terrain.WorldWidth, terrain.WorldDepth) * 1.25f;
-            cameraController.Initialize(new Vector3(terrain.WorldWidth * 0.5f, terrain.WorldHeight * 0.25f, terrain.WorldDepth * 0.5f), cameraDistance);
+            cameraController.Initialize(GetDefaultCameraTarget(), cameraDistance);
 
             SetupLighting();
 
@@ -542,6 +542,27 @@ namespace MeteoriteSPH3D
             terrainMeshDirtyFrames = terrainMeshRebuildInterval;
         }
 
+        public Vector3 GetDefaultCameraTarget()
+        {
+            float x = terrainWidth * cellSize * 0.5f;
+            float z = terrainDepth * cellSize * 0.5f;
+            float y = terrainHeight * cellSize * 0.25f;
+
+            if (terrain != null)
+            {
+                int cx = Mathf.Clamp(terrain.Width / 2, 0, terrain.Width - 1);
+                int cz = Mathf.Clamp(terrain.Depth / 2, 0, terrain.Depth - 1);
+                float centerSurface = terrain.SurfaceHeightWorld(cx, cz);
+                float baseSurface = Mathf.Clamp(baseHeight + 1, 0, terrain.Height - 1) * terrain.CellSize;
+                y = useReliefTerrain
+                    ? Mathf.Lerp(baseSurface, centerSurface, 0.62f)
+                    : Mathf.Lerp(0f, terrain.WorldHeight, 0.25f);
+            }
+
+            return new Vector3(x, y, z);
+        }
+
+
         public int LayerAxisMax()
         {
             switch (layerViewAxis)
@@ -672,14 +693,14 @@ namespace MeteoriteSPH3D
         public void ApplyCraterRimPreset()
         {
             // 2x large crater preset: wider terrain and stronger impact while keeping voxel resolution unchanged.
-            // Does not force relief terrain, so flat-surface tests stay flat unless the menu toggle is enabled.
+            // Starts from a central mountain instead of a flat plane.
             terrainWidth = 240;
             terrainHeight = 128;
             terrainDepth = 240;
             baseHeight = 24;
             reliefAmplitudeCells = 44;
             extraWorldHeight = 20f;
-            useReliefTerrain = false;
+            useReliefTerrain = true;
             impactRadius = 17.20f;
             impactPressure = 470f;
             pressureThreshold = 52f;
