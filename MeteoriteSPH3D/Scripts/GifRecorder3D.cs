@@ -13,11 +13,11 @@ namespace MeteoriteSPH3D
     /// Animated GIF recorder for the MeteoriteSPH3D demo.
     /// S = start recording, S again = stop and save.
     ///
-    /// Version MAIN_CAMERA_VIEW_V4:
+    /// Version MAIN_CAMERA_VIEW_NEUTRAL_GIF_V5:
     /// - default capture is the visible Game view produced by the user's Main Camera;
     /// - does not pick a random camera from the scene;
     /// - hides the recorder overlay during frame grab so the GIF contains only the simulation view;
-    /// - keeps the robust RGB332 + literal LZW encoder from V3.
+    /// - uses a neutral-gray-safe GIF palette so gray voxel terrain does not turn green during recording.
     /// </summary>
     public sealed class GifRecorder3D : MonoBehaviour
     {
@@ -53,8 +53,8 @@ namespace MeteoriteSPH3D
         public bool hideOverlayWhileCapturing = true;
         public bool logEveryCapturedFrame = false;
 
-        private const string Version = "MAIN_CAMERA_VIEW_V4";
-        private static readonly byte[] Rgb332Palette = BuildRgb332Palette();
+        private const string Version = "MAIN_CAMERA_VIEW_NEUTRAL_GIF_V5";
+        private static readonly byte[] NeutralGifPalette = BuildNeutralGifPalette();
 
         private Texture2D readTexture;
         private Texture2D screenTexture;
@@ -177,7 +177,7 @@ namespace MeteoriteSPH3D
                 Directory.CreateDirectory(Path.GetDirectoryName(currentPath));
                 outputStream = new FileStream(currentPath, FileMode.Create, FileAccess.Write, FileShare.Read);
                 int delayCentiseconds = Mathf.Clamp(Mathf.RoundToInt(100f / framesPerSecond), 1, 65535);
-                gifWriter = new StreamingGifWriter(outputStream, captureWidth, captureHeight, delayCentiseconds, Rgb332Palette, loopGif);
+                gifWriter = new StreamingGifWriter(outputStream, captureWidth, captureHeight, delayCentiseconds, NeutralGifPalette, loopGif);
                 gifWriter.WriteHeader();
                 isRecording = true;
                 Debug.Log("[GifRecorder3D " + Version + "] Recording started from user's Main Camera/Game view: " + currentPath + ". Press S again to stop and save GIF.");
@@ -321,7 +321,7 @@ namespace MeteoriteSPH3D
             screenTexture.Apply(false, false);
 
             Color32[] sourcePixels = screenTexture.GetPixels32();
-            DownscaleAndQuantizeRgb332(sourcePixels, screenWidth, screenHeight, indexedBuffer, captureWidth, captureHeight);
+            DownscaleAndQuantizeNeutralPalette(sourcePixels, screenWidth, screenHeight, indexedBuffer, captureWidth, captureHeight);
             return true;
         }
 
@@ -436,12 +436,12 @@ namespace MeteoriteSPH3D
 
                 for (int x = 0; x < width; x++)
                 {
-                    target[targetRow + x] = QuantizeRgb332(pixels[sourceRow + x]);
+                    target[targetRow + x] = QuantizeNeutralPalette(pixels[sourceRow + x]);
                 }
             }
         }
 
-        private static void DownscaleAndQuantizeRgb332(Color32[] sourcePixels, int sourceWidth, int sourceHeight, byte[] target, int targetWidth, int targetHeight)
+        private static void DownscaleAndQuantizeNeutralPalette(Color32[] sourcePixels, int sourceWidth, int sourceHeight, byte[] target, int targetWidth, int targetHeight)
         {
             for (int y = 0; y < targetHeight; y++)
             {
@@ -452,33 +452,62 @@ namespace MeteoriteSPH3D
                 for (int x = 0; x < targetWidth; x++)
                 {
                     int sourceX = Mathf.Clamp((x * sourceWidth) / targetWidth, 0, sourceWidth - 1);
-                    target[targetRow + x] = QuantizeRgb332(sourcePixels[sourceRow + sourceX]);
+                    target[targetRow + x] = QuantizeNeutralPalette(sourcePixels[sourceRow + sourceX]);
                 }
             }
         }
 
-        private static byte QuantizeRgb332(Color32 color)
+        private static byte QuantizeNeutralPalette(Color32 color)
         {
-            int r = color.r >> 5;
-            int g = color.g >> 5;
-            int b = color.b >> 6;
-            return (byte)((r << 5) | (g << 2) | b);
+            int min = Mathf.Min(color.r, Mathf.Min(color.g, color.b));
+            int max = Mathf.Max(color.r, Mathf.Max(color.g, color.b));
+
+            // The old RGB332 palette had only two blue bits. Neutral gray terrain such as
+            // RGB(117,117,117) was encoded as roughly RGB(109,109,85), which looked
+            // green/yellow in GIF recordings. Near-neutral colors now go to a dedicated
+            // grayscale ramp, so the surface stays visually gray.
+            if (max - min <= 18)
+            {
+                int luma = (color.r * 299 + color.g * 587 + color.b * 114 + 500) / 1000;
+                int grayIndex = Mathf.Clamp(Mathf.RoundToInt(luma * 39f / 255f), 0, 39);
+                return (byte)(216 + grayIndex);
+            }
+
+            int r = Mathf.Clamp((color.r + 25) / 51, 0, 5);
+            int g = Mathf.Clamp((color.g + 25) / 51, 0, 5);
+            int b = Mathf.Clamp((color.b + 25) / 51, 0, 5);
+            return (byte)(r * 36 + g * 6 + b);
         }
 
-        private static byte[] BuildRgb332Palette()
+        private static byte[] BuildNeutralGifPalette()
         {
             byte[] palette = new byte[256 * 3];
 
-            for (int i = 0; i < 256; i++)
+            // 0..215: 6x6x6 color cube. This keeps hot/brown particles acceptable.
+            int index = 0;
+            for (int r = 0; r < 6; r++)
             {
-                int r = (i >> 5) & 0x07;
-                int g = (i >> 2) & 0x07;
-                int b = i & 0x03;
+                for (int g = 0; g < 6; g++)
+                {
+                    for (int b = 0; b < 6; b++)
+                    {
+                        int offset = index * 3;
+                        palette[offset] = (byte)(r * 51);
+                        palette[offset + 1] = (byte)(g * 51);
+                        palette[offset + 2] = (byte)(b * 51);
+                        index++;
+                    }
+                }
+            }
 
-                int offset = i * 3;
-                palette[offset] = (byte)(r * 255 / 7);
-                palette[offset + 1] = (byte)(g * 255 / 7);
-                palette[offset + 2] = (byte)(b * 255 / 3);
+            // 216..255: exact neutral grayscale ramp for terrain and shadows.
+            for (int i = 0; i < 40; i++)
+            {
+                byte gray = (byte)Mathf.Clamp(Mathf.RoundToInt(i * 255f / 39f), 0, 255);
+                int offset = (216 + i) * 3;
+                palette[offset] = gray;
+                palette[offset + 1] = gray;
+                palette[offset + 2] = gray;
             }
 
             return palette;
