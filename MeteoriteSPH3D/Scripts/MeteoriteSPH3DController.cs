@@ -244,7 +244,7 @@ namespace MeteoriteSPH3D
         public int depositionBatchMaxQueued = 2048;
         [Tooltip("When active particles drop below this fraction of particles created by the last impact, remaining deposit candidates are forced to settle instead of simulating a long tail.")]
         public bool forceDepositTailUnderInitialFraction = true;
-        [Range(0.001f, 0.10f)] public float tailForceDepositInitialFraction = 0.01f;
+        [Range(0.001f, 0.10f)] public float tailForceDepositInitialFraction = 0.05f;
         [Tooltip("Visible terrain mesh rebuild interval used after the tail cleanup mode starts.")]
         public int tailMeshRebuildInterval = 8;
         [Tooltip("Chunk rebuild budget used after the tail cleanup mode starts.")]
@@ -360,8 +360,10 @@ namespace MeteoriteSPH3D
         public float LastGpuParticleUploadMs { get; private set; }
         public float LastMeshRebuildMs { get; private set; }
         public int LastCreatedParticles { get; private set; }
+        public int LastActivatedVoxels { get; private set; }
         public int LastSolidifiedParticles { get; private set; }
         public int TotalCreatedParticles { get; private set; }
+        public int TotalActivatedVoxels { get; private set; }
         public int TotalSolidifiedParticles { get; private set; }
 
         private VoxelTerrain3D terrain;
@@ -798,8 +800,10 @@ namespace MeteoriteSPH3D
             lastImpactInitialParticleCount = 0;
             tailDepositionModeLatched = false;
             LastCreatedParticles = 0;
+            LastActivatedVoxels = 0;
             LastSolidifiedParticles = 0;
             TotalCreatedParticles = 0;
+            TotalActivatedVoxels = 0;
             TotalSolidifiedParticles = 0;
             LastFrameMs = 0f;
             LastControllerUpdateMs = 0f;
@@ -914,7 +918,7 @@ namespace MeteoriteSPH3D
             depositionBatchFrames = 4;
             depositionBatchMaxQueued = 2048;
             forceDepositTailUnderInitialFraction = true;
-            tailForceDepositInitialFraction = 0.01f;
+            tailForceDepositInitialFraction = 0.05f;
             tailMeshRebuildInterval = 8;
             tailMaxTerrainChunkRebuildsPerFrame = 6;
             forceDepositOldParticles = true;
@@ -1014,6 +1018,7 @@ namespace MeteoriteSPH3D
             LastGpuParticleUploadMs = 0f;
             LastMeshRebuildMs = 0f;
             LastCreatedParticles = 0;
+            LastActivatedVoxels = 0;
             LastSolidifiedParticles = 0;
 
             if (InputBridge3D.KeyDown(KeyCode.R)) ResetSimulation();
@@ -1858,6 +1863,7 @@ namespace MeteoriteSPH3D
             gpuCompactCooldownRemaining = 0;
 
             int created = 0;
+            int activatedVoxels = 0;
             Vector3Int min = terrain.WorldToCell(center - Vector3.one * impactRadius);
             Vector3Int max = terrain.WorldToCell(center + Vector3.one * impactRadius);
 
@@ -1901,6 +1907,7 @@ namespace MeteoriteSPH3D
                         {
                             Vector3 v = InitialEjectaVelocity(pos, center, falloff, nr);
                             terrain.SetSolid(x, y, z, false, 0f, 0f, 0f);
+                            activatedVoxels++;
 
                             int copies = Mathf.Clamp(impactParticleCopiesPerActivatedVoxel, 1, 16);
                             float particleTemperature = Mathf.Max(cell.temperature, impactTemperature * falloff * 0.65f);
@@ -1922,7 +1929,16 @@ namespace MeteoriteSPH3D
             }
 
             LastCreatedParticles = created;
+            LastActivatedVoxels = activatedVoxels;
             TotalCreatedParticles += created;
+            TotalActivatedVoxels += activatedVoxels;
+            if (created > activatedVoxels)
+            {
+                Debug.LogWarning("[MeteoriteSPH3D] Создано больше частиц, чем удалено вокселей: created=" + created
+                    + ", activatedVoxels=" + activatedVoxels
+                    + ", copiesPerVoxel=" + impactParticleCopiesPerActivatedVoxel
+                    + ". Это добавляет лишний материал.");
+            }
             lastImpactInitialParticleCount = Mathf.Max(1, created);
             tailDepositionModeLatched = false;
             if (deferVisualApplyUntilParticlesStop && created > 0)

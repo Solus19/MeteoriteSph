@@ -29,29 +29,33 @@ namespace MeteoriteSPH3D
         public KeyCode startBenchmarkKey = KeyCode.F8;
         public KeyCode stopBenchmarkKey = KeyCode.F7;
         public int impactsPerSize = 1;
-        public float[] impactSizeScales = new float[] { 1f, 2.5f, 5f, 10f };
+        public float[] impactSizeScales = new float[] { 1f, 2.5f, 5f };
         [Tooltip("Fresh terrain is generated before every impact. This keeps all 10 runs of one size comparable.")]
         public bool resetTerrainBeforeEachImpact = true;
         [Tooltip("How terrain is scaled for large benchmark sizes. Strict mode scales X/Z exactly by impact size; Y can be handled separately by terrainHeightScaleMode.")]
-        public MapScaleMode mapScaleMode = MapScaleMode.PhysicalWorldSizeWithVoxelBudget;
+        public MapScaleMode mapScaleMode = MapScaleMode.StrictVoxelCounts;
         [Tooltip("Hard voxel budget for benchmark terrain. The physical map/impact scale is preserved by increasing cellSize when the requested X/Z/Y allocation would exceed this budget.")]
         public int maxBenchmarkVoxelCount = 50000000;
         [Tooltip("If strict mode is selected manually and the requested terrain is over budget, skip instead of risking an OutOfMemoryException.")]
-        public bool skipStrictScaleWhenOverBudget = true;
+        public bool skipStrictScaleWhenOverBudget = false;
         [Tooltip("Always clamp generated benchmark terrain to maxBenchmarkVoxelCount before ResetSimulation(). This prevents OutOfMemoryException even when strict X/Z scale is selected.")]
-        public bool clampTerrainToVoxelBudget = true;
+        public bool clampTerrainToVoxelBudget = false;
         [Tooltip("For very large impacts, keep the physical terrain footprint capped while the crater/impact itself can keep growing. Example: x10 impact on an x5 map.")]
         public bool capPhysicalTerrainScale = true;
-        [Tooltip("Maximum physical X/Z map scale used by the benchmark. x10 uses an x5 terrain when this is 5.")]
-        public float maxPhysicalTerrainScale = 5f;
+        [Tooltip("Maximum physical X/Z map scale used by the benchmark. x5 impact uses an x2.5 terrain when this is 2.5.")]
+        public float maxPhysicalTerrainScale = 2.5f;
         [Tooltip("Use one fixed terrain size for all impact sizes. The impact radius/depth still changes by size_scale, but the map is always generated as fixedBenchmarkTerrainScale.")]
         public bool useFixedBenchmarkTerrainScaleForAllImpacts = true;
-        [Tooltip("Physical terrain scale used for every benchmark impact when useFixedBenchmarkTerrainScaleForAllImpacts is enabled. Set to 5 to run x1/x1.5/x5 on the same x5 map.")]
-        public float fixedBenchmarkTerrainScale = 5f;
+        [Tooltip("Physical terrain scale used for every benchmark impact when useFixedBenchmarkTerrainScaleForAllImpacts is enabled. Set to 2.5 to run x1/x2.5/x5 on the same half-size map.")]
+        public float fixedBenchmarkTerrainScale = 2.5f;
+        [Tooltip("Benchmark-only vertical thickness multiplier. 0.5 means the generated Y resolution/base thickness is two times thinner while X/Z stay unchanged.")]
+        public float benchmarkTerrainHeightMultiplier = 0.5f;
 
         [Header("Benchmark particle load scaling")]
-        [Tooltip("When OOM-safe scaling increases cellSize, compensate by emitting several particles per activated voxel. This prevents x5 from having the same particle count as x2 when both hit the voxel budget.")]
-        public bool compensateParticleCountForCoarseGrid = true;
+        [Tooltip("When OOM-safe scaling increases cellSize, compensate by emitting several particles per activated voxel. This is disabled by default because it creates extra material: one removed voxel can become several deposited voxels.")]
+        public bool compensateParticleCountForCoarseGrid = false;
+        [Tooltip("Mass-conservative benchmark mode: every activated voxel becomes exactly one SPH particle. Keep this enabled for visual/volume-correct impact comparisons.")]
+        public bool enforceOneParticlePerActivatedVoxelForBenchmark = true;
         [Tooltip("No extra copies are added while sizeScale / horizontalVoxelScale is below this value. Keeps x2 close to the normal algorithm when it barely hits the voxel budget.")]
         public float coarseGridParticleMultiplierDeadZone = 1.20f;
         [Tooltip("Normal upper limit for particle copies per activated voxel. High values can trigger Windows GPU TDR on large impacts.")]
@@ -63,11 +67,20 @@ namespace MeteoriteSPH3D
         [Tooltip("Protect benchmark runs from Windows GPU Timeout Detection and Recovery by capping large particle workloads and reducing substeps on big impacts.")]
         public bool tdrSafeBenchmarkMode = true;
         [Tooltip("Hard cap for particle buffer size during auto benchmark. Keeps compute dispatches below the level that can reset D3D11.")]
-        public int hardMaxParticlesPerBenchmarkImpact = 700000;
+        public int hardMaxParticlesPerBenchmarkImpact = 8000000;
         [Tooltip("Hard cap for particles created by one benchmark impact.")]
-        public int hardMaxCreatedParticlesPerBenchmarkImpact = 650000;
+        public int hardMaxCreatedParticlesPerBenchmarkImpact = 8000000;
         [Tooltip("Hard cap for the GPU deposit candidate buffer during benchmark.")]
-        public int hardGpuDepositCandidateCapacityBenchmark = 262144;
+        public int hardGpuDepositCandidateCapacityBenchmark = 1048576;
+
+        [Header("Benchmark particle cap removal")]
+        [Tooltip("Remove the old 650k/700k benchmark particle cap. The buffer is expanded from the estimated impact volume instead.")]
+        public bool removeBenchmarkParticleCaps = true;
+        [Tooltip("Emergency upper bound for expanded benchmark particle buffers. This is not the old visual cap; it only prevents impossible ComputeBuffer allocations.")]
+        public int maxExpandedBenchmarkParticles = 8000000;
+        [Tooltip("How much of the ellipsoid impact volume is reserved as particle capacity. Increase if x5 still reports created_particles == max_created_particles.")]
+        [Range(0.05f, 1.0f)] public float impactVolumeParticleCapacityFraction = 0.35f;
+
         [Tooltip("Enable cheaper GPU stepping at or above this size scale.")]
         public float tdrSafeScaleThreshold = 2f;
         public int tdrSafeSubsteps = 1;
@@ -109,7 +122,7 @@ namespace MeteoriteSPH3D
         [Header("Screenshot camera")]
         public bool reframeCameraBeforeFinalScreenshot = true;
         [Tooltip("Place the screenshot camera above a terrain corner and look at the crater/map center. This makes x5/x10 screenshots show the whole crater instead of a close edge crop.")]
-        public bool screenshotFromTerrainCorner = true;
+        public bool screenshotFromTerrainCorner = false;
         [Tooltip("Corner side for X: -1 = min X corner, +1 = max X corner.")]
         public int screenshotCornerXSign = -1;
         [Tooltip("Corner side for Z: -1 = min Z corner, +1 = max Z corner.")]
@@ -117,30 +130,26 @@ namespace MeteoriteSPH3D
         [Tooltip("How far outside the selected corner the camera is placed, relative to the larger map side.")]
         public float screenshotCornerOutsetToMapSpan = 0.0f;
         [Tooltip("Camera height above the target, relative to the larger map side.")]
-        public float screenshotCornerHeightToMapSpan = 0.85f;
+        public float screenshotCornerHeightToMapSpan = 1.25f;
         [Tooltip("If true, screenshot target is the impact point. If false, target is exact map center.")]
-        public bool screenshotCornerLookAtImpact = false;
+        public bool screenshotCornerLookAtImpact = true;
         [Tooltip("Use orthographic camera for benchmark screenshots. This guarantees that large x5/x10 maps fit into the image from the selected corner.")]
         public bool useOrthographicCameraForScreenshots = true;
         [Tooltip("Orthographic size is computed from map diagonal multiplied by this factor. Increase if screenshots still crop map edges.")]
-        public float screenshotOrthographicSizeToMapDiagonal = 0.72f;
+        public float screenshotOrthographicSizeToMapDiagonal = 1.05f;
         [Tooltip("Extra multiplier for orthographic screenshot framing.")]
-        public float screenshotOrthographicPadding = 1.08f;
-        [Tooltip("Fit screenshot camera by X/Z ground footprint instead of full 3D terrain height. This makes the map closer and more detailed.")]
-        public bool screenshotFitGroundFootprintOnly = true;
-        [Tooltip("Zoom factor after fitting the ground footprint. Values below 1 crop map corners slightly and make the crater more readable.")]
-        public float screenshotCornerCropForDetail = 0.86f;
+        public float screenshotOrthographicPadding = 1.25f;
         [Tooltip("For large maps like x5, lift the corner camera extra high so the crater stays visible instead of the terrain wall dominating the frame.")]
-        public float largeMapCornerHeightToDiagonal = 1.00f;
+        public float largeMapCornerHeightToDiagonal = 1.85f;
         [Tooltip("If size scale is at least this threshold, use the extra-tall corner framing for screenshots.")]
         public float largeMapScreenshotScaleThreshold = 4.5f;
         [Tooltip("Extra orthographic framing for large maps like x5 so the whole field fits into one screenshot.")]
-        public float largeMapOrthoSizeToDiagonal = 0.80f;
-        public float screenshotCameraDistanceToImpactRadius = 4.0f;
-        public float screenshotCameraMinDistance = 48f;
+        public float largeMapOrthoSizeToDiagonal = 1.20f;
+        public float screenshotCameraDistanceToImpactRadius = 3.0f;
+        public float screenshotCameraMinDistance = 36f;
         public float screenshotCameraYaw = 45f;
-        public float screenshotCameraPitch = 42f;
-        public float screenshotCameraTargetHeightToRadius = 0.12f;
+        public float screenshotCameraPitch = 30f;
+        public float screenshotCameraTargetHeightToRadius = 0.08f;
         public string screenshotFilePrefix = "final_crater";
         [Tooltip("Use a dedicated temporary camera for benchmark screenshots instead of capturing the current Game view. This avoids CameraController/editor interference that caused corner-only screenshots.")]
         public bool useDedicatedRenderCameraForScreenshots = true;
@@ -152,24 +161,20 @@ namespace MeteoriteSPH3D
         [Header("Tiny tail safety")]
         [Tooltip("If the run is stuck on a tiny tail of particles, finish them forcibly instead of timing out. This is for benchmark stability; the ignored particles are visually negligible.")]
         public bool forceFinishTinyTail = true;
-        [Tooltip("Maximum active particles that can be forcibly cleared after tinyTailMaxSeconds in tail mode.")]
-        public int tinyTailMaxActiveParticles = 16;
-        [Tooltip("Benchmark safety: if active particles are below this fraction of particles created by the current impact and stay there too long, finish them forcibly. Fixes x10 getting stuck on hundreds of particles after tail mode.")]
-        public float stuckTailActiveFraction = 0.001f;
-        [Tooltip("Minimum absolute particle count allowed for stuck-tail finish. The effective threshold is max(tinyTailMaxActiveParticles, createdParticles * stuckTailActiveFraction, stuckTailMinActiveParticles).") ]
-        public int stuckTailMinActiveParticles = 512;
-        [Tooltip("Seconds to wait in stuck-tail state before forcibly finishing remaining particles.")]
-        public float stuckTailMaxSeconds = 10f;
-        [Tooltip("How long the test may stay with <= tinyTailMaxActiveParticles before the remaining particles are cleared.")]
-        public float tinyTailMaxSeconds = 6f;
+        [Tooltip("Benchmark tail cleanup: if active particles are below this number after tail mode starts, they can be forcibly cleared after tinyTailMaxSeconds.")]
+        public int tinyTailMaxActiveParticles = 15000;
+        [Tooltip("How long the test may stay with <= tinyTailMaxActiveParticles before the remaining benchmark tail particles are cleared.")]
+        public float tinyTailMaxSeconds = 2f;
         [Tooltip("Only apply the tiny-tail escape after the normal <1% tail mode has started.")]
         public bool tinyTailOnlyAfterTailMode = true;
         public float maxSecondsPerImpact = 120f;
+        [Tooltip("If true, auto benchmark never stops an impact by wall-clock timeout. It finishes only when particles settle or when F7/Stop is pressed.")]
+        public bool disableImpactTimeout = true;
         [Header("Timeout / retry policy")]
         [Tooltip("When enabled, each scale is run once. Extra attempts are started only if the previous attempt timed out.")]
-        public bool retryOnlyTimedOutRuns = true;
+        public bool retryOnlyTimedOutRuns = false;
         [Tooltip("Maximum attempts for one scale when retryOnlyTimedOutRuns is enabled. If the first run succeeds, no retries are made.")]
-        public int maxAttemptsPerSizeWhenTimeout = 10;
+        public int maxAttemptsPerSizeWhenTimeout = 1;
         [Tooltip("Timeout for x10 and larger sizes, in seconds. 300 seconds = 5 minutes.")]
         public float x10MaxSecondsPerImpact = 300f;
         [Tooltip("Scale from which x10MaxSecondsPerImpact is used.")]
@@ -303,9 +308,9 @@ namespace MeteoriteSPH3D
             int plannedPerSize = retryOnlyTimedOutRuns ? Mathf.Max(1, maxAttemptsPerSizeWhenTimeout) : Mathf.Max(1, impactsPerSize);
             totalPlannedRuns = Mathf.Max(0, sizeCount) * plannedPerSize;
             executedRunsSoFar = 0;
-            Debug.Log("[MeteoriteSPH3D Benchmark] Запущен. Размеры: x1, x1.5, x5. План: минимум " + sizeCount
+            Debug.Log("[MeteoriteSPH3D Benchmark] Запущен. Размеры: x1, x2.5, x5. План: минимум " + sizeCount
                 + ", максимум " + totalPlannedRuns
-                + " ударов. Повторы запускаются только после timeout=" + retryOnlyTimedOutRuns + ". F7 — остановка.");
+                + " ударов. Timeout отключён=" + disableImpactTimeout + ". F7 — остановка.");
             routine = StartCoroutine(RunBenchmark());
         }
 
@@ -371,9 +376,8 @@ namespace MeteoriteSPH3D
 
                 if (verboseConsoleProgress)
                 {
-                    Debug.Log("[MeteoriteSPH3D Benchmark] Порядок размеров: x1 → x1.5 → x5. "
-                        + "Каждый размер запускается один раз; повторные попытки идут только если предыдущий проход ушёл в timeout. "
-                        + "Для x10, если его вернуть в список, timeout=" + F(GetTimeoutSecondsForScale(10f)) + " с.");
+                    Debug.Log("[MeteoriteSPH3D Benchmark] Порядок размеров: x1 → x2.5 → x5. "
+                        + "Каждый размер запускается один раз; timeout отключён, остановка только по завершению осаждения или F7.");
                 }
 
                 for (int orderPos = 0; orderPos < runOrder.Count; orderPos++)
@@ -515,6 +519,7 @@ namespace MeteoriteSPH3D
             Vector3 hit = controller.GetDefaultBenchmarkImpactPoint();
             int solidBefore = controller.SolidVoxelCount;
             int totalCreatedBefore = controller.TotalCreatedParticles;
+            int totalActivatedBefore = controller.TotalActivatedVoxels;
             int totalSolidifiedBefore = controller.TotalSolidifiedParticles;
             int frameStart = Time.frameCount;
             float start = Time.realtimeSinceStartup;
@@ -525,7 +530,6 @@ namespace MeteoriteSPH3D
             bool tinyTailForced = false;
             int tinyTailForcedActiveCount = 0;
             float tinyTailStartTime = -1f;
-            float stuckTailStartTime = -1f;
             RunStats stats = new RunStats();
             float timeoutSeconds = GetTimeoutSecondsForScale(sizeScale);
 
@@ -535,7 +539,7 @@ namespace MeteoriteSPH3D
                 Debug.Log("[MeteoriteSPH3D Benchmark] Удар START " + globalRun + "/" + Mathf.Max(1, totalPlannedRuns)
                     + ": размер " + FormatScaleLabel(sizeScale)
                     + ", попытка " + runIndex
-                    + ", timeout=" + F(timeoutSeconds) + "s"
+                    + ", timeout=" + (disableImpactTimeout ? "OFF" : F(timeoutSeconds) + "s")
                     + ", mode=" + (renderFinalVisualAndScreenshot ? "FINAL_RENDER_SCREENSHOT" : "HIDDEN_NO_COMMIT")
                     + ", hit=(" + F(hit.x) + ", " + F(hit.y) + ", " + F(hit.z) + ").");
             }
@@ -548,10 +552,18 @@ namespace MeteoriteSPH3D
             if (verboseConsoleProgress)
             {
                 int createdAfterApply = controller.TotalCreatedParticles - totalCreatedBefore;
+                int activatedAfterApply = controller.TotalActivatedVoxels - totalActivatedBefore;
                 Debug.Log("[MeteoriteSPH3D Benchmark] Удар применён: размер " + FormatScaleLabel(sizeScale)
                     + ", повтор " + runIndex
+                    + ", выбито вокселей=" + activatedAfterApply
                     + ", создано частиц=" + createdAfterApply
+                    + ", copiesPerVoxel=" + controller.impactParticleCopiesPerActivatedVoxel
                     + ", active=" + controller.ActiveParticleCount + ".");
+                if (createdAfterApply > activatedAfterApply)
+                {
+                    Debug.LogWarning("[MeteoriteSPH3D Benchmark] Материал НЕ консервативен: частиц больше, чем выбитых вокселей. created="
+                        + createdAfterApply + ", activated=" + activatedAfterApply + ".");
+                }
             }
 
             while (true)
@@ -566,32 +578,24 @@ namespace MeteoriteSPH3D
                 if (!tinyTailForced && forceFinishTinyTail && controller.ActiveParticleCount > 0)
                 {
                     int activeNow = controller.ActiveParticleCount;
-                    int createdForRun = Mathf.Max(1, controller.TotalCreatedParticles - totalCreatedBefore);
-                    int stuckTailThreshold = Mathf.Max(Mathf.Max(1, tinyTailMaxActiveParticles), stuckTailMinActiveParticles, Mathf.CeilToInt(createdForRun * Mathf.Max(0f, stuckTailActiveFraction)));
                     bool tinyTail = activeNow <= Mathf.Max(1, tinyTailMaxActiveParticles);
-                    bool stuckTail = activeNow <= stuckTailThreshold;
                     bool tailModeReady = !tinyTailOnlyAfterTailMode || controller.IsTailDepositModeActive();
 
-                    if ((tinyTail || stuckTail) && tailModeReady)
+                    if (tinyTail && tailModeReady)
                     {
-                        float waitSeconds = tinyTail ? tinyTailMaxSeconds : stuckTailMaxSeconds;
                         if (tinyTailStartTime < 0f)
                         {
                             tinyTailStartTime = Time.realtimeSinceStartup;
-                            stuckTailStartTime = Time.realtimeSinceStartup;
                             if (verboseConsoleProgress)
                             {
-                                Debug.Log("[MeteoriteSPH3D Benchmark] Tail finish watch: active=" + activeNow
-                                    + ", created=" + createdForRun
-                                    + ", threshold=" + stuckTailThreshold
+                                Debug.Log("[MeteoriteSPH3D Benchmark] Tiny tail detected: active=" + activeNow
                                     + ", размер " + FormatScaleLabel(sizeScale)
                                     + ", повтор " + runIndex
-                                    + ". Если хвост не исчезнет за " + F(waitSeconds) + " с, он будет принудительно завершён.");
+                                    + ". Если хвост не исчезнет за " + F(tinyTailMaxSeconds) + " с, он будет принудительно завершён.");
                             }
                         }
 
-                        float tailElapsed = Time.realtimeSinceStartup - (tinyTail ? tinyTailStartTime : stuckTailStartTime);
-                        if (tailElapsed >= Mathf.Max(0.1f, waitSeconds))
+                        if (Time.realtimeSinceStartup - tinyTailStartTime >= Mathf.Max(0.1f, tinyTailMaxSeconds))
                         {
                             tinyTailForced = true;
                             tinyTailForcedActiveCount = activeNow;
@@ -603,9 +607,7 @@ namespace MeteoriteSPH3D
                             }
                             if (verboseConsoleProgress)
                             {
-                                Debug.LogWarning("[MeteoriteSPH3D Benchmark] Tail forced finish: active=" + tinyTailForcedActiveCount
-                                    + ", created=" + createdForRun
-                                    + ", threshold=" + stuckTailThreshold
+                                Debug.LogWarning("[MeteoriteSPH3D Benchmark] Tiny tail forced finish: active=" + tinyTailForcedActiveCount
                                     + ", размер " + FormatScaleLabel(sizeScale)
                                     + ", повтор " + runIndex
                                     + ". Это не timeout; оставшиеся частицы отброшены, чтобы не держать тест.");
@@ -615,7 +617,6 @@ namespace MeteoriteSPH3D
                     else
                     {
                         tinyTailStartTime = -1f;
-                        stuckTailStartTime = -1f;
                     }
                 }
 
@@ -636,7 +637,7 @@ namespace MeteoriteSPH3D
 
                 if (zeroFrames >= Mathf.Max(1, zeroActiveFramesToFinish)) break;
 
-                if (Time.realtimeSinceStartup - start >= Mathf.Max(1f, timeoutSeconds))
+                if (!disableImpactTimeout && Time.realtimeSinceStartup - start >= Mathf.Max(1f, timeoutSeconds))
                 {
                     timedOut = true;
                     if (verboseConsoleProgress)
@@ -653,6 +654,7 @@ namespace MeteoriteSPH3D
             float wallTime = (simulationDoneTime >= 0f ? simulationDoneTime : Time.realtimeSinceStartup) - start;
             int frames = Mathf.Max(1, (simulationDoneFrame >= 0 ? simulationDoneFrame : Time.frameCount) - frameStart);
             int created = controller.TotalCreatedParticles - totalCreatedBefore;
+            int activated = controller.TotalActivatedVoxels - totalActivatedBefore;
             int solidified = controller.TotalSolidifiedParticles - totalSolidifiedBefore;
             int solidAfter = controller.SolidVoxelCount;
 
@@ -664,7 +666,7 @@ namespace MeteoriteSPH3D
                 yield return StartCoroutine(CaptureFinalScreenshot(sizeIndex, sizeScale, runIndex, hit, path => screenshotPath = path));
             }
 
-            WriteSummary(sizeIndex, sizeScale, runIndex, scaleInfo, hit, wallTime, frames, created, solidified, solidBefore, solidAfter, timedOut, stats, screenshotPath);
+            WriteSummary(sizeIndex, sizeScale, runIndex, scaleInfo, hit, wallTime, frames, activated, created, solidified, solidBefore, solidAfter, timedOut, stats, screenshotPath);
 
             if (finishAtZeroParticlesWithoutVisualCommit && !renderFinalVisualAndScreenshot)
             {
@@ -812,58 +814,29 @@ namespace MeteoriteSPH3D
                 float sz = screenshotCornerZSign < 0 ? -1f : 1f;
                 float mapDiagonal = Mathf.Sqrt(width * width + depth * depth);
                 bool largeMapFrame = sizeScale >= Mathf.Max(1f, largeMapScreenshotScaleThreshold);
-
-                Vector3 viewDir = new Vector3(-sx * 0.78f, -1.18f, -sz * 0.78f).normalized;
-                float cornerDistance = Mathf.Max(mapSpan * Mathf.Max(0.70f, screenshotCornerHeightToMapSpan), mapDiagonal * (largeMapFrame ? Mathf.Max(0.85f, largeMapCornerHeightToDiagonal) : 0.75f), height * 1.2f, screenshotCameraMinDistance);
-                Vector3 pos = target - viewDir * cornerDistance;
+                float outset = Mathf.Max(0f, screenshotCornerOutsetToMapSpan) * mapSpan;
+                if (largeMapFrame) outset = Mathf.Max(outset, mapSpan * 0.10f);
+                float x = sx < 0f ? 0f - outset : width + outset;
+                float z = sz < 0f ? 0f - outset : depth + outset;
+                float y = target.y + Mathf.Max(screenshotCameraMinDistance,
+                    mapSpan * Mathf.Max(0.90f, screenshotCornerHeightToMapSpan),
+                    mapDiagonal * (largeMapFrame ? Mathf.Max(1.35f, largeMapCornerHeightToDiagonal) : 1.10f),
+                    radius * (largeMapFrame ? 5.0f : 4.0f),
+                    height * (largeMapFrame ? 2.20f : 1.80f));
+                Vector3 pos = new Vector3(x, y, z);
 
                 cam.transform.position = pos;
                 cam.transform.rotation = Quaternion.LookRotation((target - pos).normalized, Vector3.up);
-                cam.farClipPlane = Mathf.Max(cam.farClipPlane, mapDiagonal * 4f + height * 4f + radius * 3f + 200f);
+                cam.farClipPlane = Mathf.Max(cam.farClipPlane, mapDiagonal * 5f + height * 5f + radius * 4f + 300f);
                 cam.nearClipPlane = 0.1f;
 
                 if (useOrthographicCameraForScreenshots)
                 {
                     cam.orthographic = true;
-
-                    Vector3 right = cam.transform.right;
-                    Vector3 up = cam.transform.up;
-                    float footprintY = screenshotFitGroundFootprintOnly ? target.y : 0f;
-                    Vector3[] boundsCorners = screenshotFitGroundFootprintOnly
-                        ? new Vector3[4]
-                        {
-                            new Vector3(0f, footprintY, 0f),
-                            new Vector3(width, footprintY, 0f),
-                            new Vector3(0f, footprintY, depth),
-                            new Vector3(width, footprintY, depth)
-                        }
-                        : new Vector3[8]
-                        {
-                            new Vector3(0f, 0f, 0f),
-                            new Vector3(width, 0f, 0f),
-                            new Vector3(0f, 0f, depth),
-                            new Vector3(width, 0f, depth),
-                            new Vector3(0f, height, 0f),
-                            new Vector3(width, height, 0f),
-                            new Vector3(0f, height, depth),
-                            new Vector3(width, height, depth)
-                        };
-
-                    float halfWidthNeeded = 0f;
-                    float halfHeightNeeded = 0f;
-                    for (int i = 0; i < boundsCorners.Length; i++)
-                    {
-                        Vector3 rel = boundsCorners[i] - target;
-                        halfWidthNeeded = Mathf.Max(halfWidthNeeded, Mathf.Abs(Vector3.Dot(rel, right)));
-                        halfHeightNeeded = Mathf.Max(halfHeightNeeded, Mathf.Abs(Vector3.Dot(rel, up)));
-                    }
-
-                    float aspect = cam.aspect > 0.01f ? cam.aspect : (16f / 9f);
-                    float fitByWidth = halfWidthNeeded / aspect;
-                    float fitByHeight = halfHeightNeeded;
-                    float padding = Mathf.Max(1.0f, screenshotOrthographicPadding) * (largeMapFrame ? 1.03f : 1.0f);
-                    float cropForDetail = Mathf.Clamp(screenshotCornerCropForDetail, 0.55f, 1.05f);
-                    cam.orthographicSize = Mathf.Max(screenshotCameraMinDistance * 0.25f, Mathf.Max(fitByWidth, fitByHeight) * padding * cropForDetail);
+                    float orthoFactor = largeMapFrame ? Mathf.Max(largeMapOrthoSizeToDiagonal, screenshotOrthographicSizeToMapDiagonal) : Mathf.Max(0.55f, screenshotOrthographicSizeToMapDiagonal);
+                    float ortho = mapDiagonal * orthoFactor * Mathf.Max(1.0f, screenshotOrthographicPadding);
+                    // Orthographic size is half of vertical view. For x5, intentionally over-frame so the crater and the whole field stay inside one shot.
+                    cam.orthographicSize = Mathf.Max(screenshotCameraMinDistance * 0.5f, ortho);
                 }
 
                 CameraController3D cameraController = allowControllerSync ? cam.GetComponent<CameraController3D>() : null;
@@ -877,6 +850,12 @@ namespace MeteoriteSPH3D
                     cameraController.Initialize(target, Vector3.Distance(pos, target));
                     cam.transform.position = pos;
                     cam.transform.rotation = Quaternion.LookRotation((target - pos).normalized, Vector3.up);
+                    if (useOrthographicCameraForScreenshots)
+                    {
+                        cam.orthographic = true;
+                        float orthoFactor2 = largeMapFrame ? Mathf.Max(largeMapOrthoSizeToDiagonal, screenshotOrthographicSizeToMapDiagonal) : Mathf.Max(0.55f, screenshotOrthographicSizeToMapDiagonal);
+                        cam.orthographicSize = Mathf.Max(screenshotCameraMinDistance * 0.5f, mapDiagonal * orthoFactor2 * Mathf.Max(1.0f, screenshotOrthographicPadding));
+                    }
                 }
 
                 if (verboseConsoleProgress)
@@ -889,8 +868,6 @@ namespace MeteoriteSPH3D
                         + ", camPos=(" + F(cam.transform.position.x) + ", " + F(cam.transform.position.y) + ", " + F(cam.transform.position.z) + ")"
                         + ", orthographic=" + cam.orthographic
                         + ", orthoSize=" + F(cam.orthographicSize)
-                        + ", crop=" + F(screenshotCornerCropForDetail)
-                        + (screenshotFitGroundFootprintOnly ? ", fit=XZ" : ", fit=XYZ")
                         + (largeMapFrame ? ", largeMapFrame=ON" : ", largeMapFrame=OFF") + ".");
                 }
                 return;
@@ -916,7 +893,7 @@ namespace MeteoriteSPH3D
 
             if (verboseConsoleProgress)
             {
-                Debug.Log("[MeteoriteSPH3D Benchmark] Камера для скриншота наведена на точку удара: размер "
+                Debug.Log("[MeteoriteSPH3D Benchmark] Камера для скриншота наведена на центр кратера: размер "
                     + FormatScaleLabel(sizeScale)
                     + ", hit=(" + F(impactHitPoint.x) + ", " + F(impactHitPoint.y) + ", " + F(impactHitPoint.z) + ")"
                     + ", radius=" + F(radius) + ", distance=" + F(distance)
@@ -1036,7 +1013,7 @@ namespace MeteoriteSPH3D
             SamplesCsvPath = Path.Combine(dir, "auto_impact_samples.csv");
 
             summaryWriter = new StreamWriter(SummaryCsvPath, false, new UTF8Encoding(false));
-            summaryWriter.WriteLine("size_index,size_scale,run_index,map_scale_mode,terrain_physical_scale,applied_voxel_scale,horizontal_voxel_scale,vertical_voxel_scale,world_cell_scale,terrain_width,terrain_height,terrain_depth,cell_size,impact_radius,impact_particle_copies_per_voxel,max_particles,max_created_particles,created_particles,solidified_particles,solid_voxels_before,solid_voxels_after,wall_time_s,frames,timeout,cpu_frame_ms_avg,cpu_frame_ms_p95,cpu_frame_ms_max,gpu_frame_ms_avg,gpu_frame_ms_p95,gpu_frame_ms_max,frame_ms_avg,frame_ms_p95,frame_ms_max,controller_ms_avg,controller_ms_p95,controller_ms_max,gpu_sim_ms_avg,gpu_sim_ms_p95,gpu_sim_ms_max,cpu_sim_ms_avg,cpu_sim_ms_p95,cpu_sim_ms_max,readback_ms_avg,readback_ms_p95,readback_ms_max,solidify_ms_avg,solidify_ms_p95,solidify_ms_max,terrain_upload_ms_avg,terrain_upload_ms_p95,terrain_upload_ms_max,mesh_rebuild_ms_avg,mesh_rebuild_ms_p95,mesh_rebuild_ms_max,ram_allocated_mb_max,ram_reserved_mb_max,mono_heap_mb_max,gpu_memory_total_mb,hit_x,hit_y,hit_z,screenshot_path");
+            summaryWriter.WriteLine("size_index,size_scale,run_index,map_scale_mode,terrain_physical_scale,applied_voxel_scale,horizontal_voxel_scale,vertical_voxel_scale,world_cell_scale,terrain_width,terrain_height,terrain_depth,cell_size,impact_radius,impact_particle_copies_per_voxel,max_particles,max_created_particles,created_particles,solidified_particles,solid_voxels_before,solid_voxels_after,wall_time_s,frames,timeout,cpu_frame_ms_avg,cpu_frame_ms_p95,cpu_frame_ms_max,gpu_frame_ms_avg,gpu_frame_ms_p95,gpu_frame_ms_max,frame_ms_avg,frame_ms_p95,frame_ms_max,controller_ms_avg,controller_ms_p95,controller_ms_max,gpu_sim_ms_avg,gpu_sim_ms_p95,gpu_sim_ms_max,cpu_sim_ms_avg,cpu_sim_ms_p95,cpu_sim_ms_max,readback_ms_avg,readback_ms_p95,readback_ms_max,solidify_ms_avg,solidify_ms_p95,solidify_ms_max,terrain_upload_ms_avg,terrain_upload_ms_p95,terrain_upload_ms_max,mesh_rebuild_ms_avg,mesh_rebuild_ms_p95,mesh_rebuild_ms_max,ram_allocated_mb_max,ram_reserved_mb_max,mono_heap_mb_max,gpu_memory_total_mb,hit_x,hit_y,hit_z,screenshot_path,activated_voxels,material_balance_voxels");
 
             if (writePerFrameSamples)
             {
@@ -1066,7 +1043,7 @@ namespace MeteoriteSPH3D
 #endif
         }
 
-        private void WriteSummary(int sizeIndex, float sizeScale, int runIndex, ScaleInfo scaleInfo, Vector3 hit, float wallTime, int frames, int created, int solidified, int solidBefore, int solidAfter, bool timedOut, RunStats stats, string screenshotPath)
+        private void WriteSummary(int sizeIndex, float sizeScale, int runIndex, ScaleInfo scaleInfo, Vector3 hit, float wallTime, int frames, int activated, int created, int solidified, int solidBefore, int solidAfter, bool timedOut, RunStats stats, string screenshotPath)
         {
             if (summaryWriter == null) return;
 
@@ -1111,15 +1088,19 @@ namespace MeteoriteSPH3D
             summaryWriter.Write(F(hit.x)); summaryWriter.Write(',');
             summaryWriter.Write(F(hit.y)); summaryWriter.Write(',');
             summaryWriter.Write(F(hit.z)); summaryWriter.Write(',');
-            summaryWriter.WriteLine(CsvEscape(screenshotPath));
+            summaryWriter.Write(CsvEscape(screenshotPath)); summaryWriter.Write(',');
+            summaryWriter.Write(activated.ToString(invariant)); summaryWriter.Write(',');
+            summaryWriter.Write((solidAfter - solidBefore).ToString(invariant)); summaryWriter.WriteLine();
             summaryWriter.Flush();
 
             Debug.Log("[MeteoriteSPH3D Benchmark] Удар DONE: размер " + FormatScaleLabel(sizeScale)
                 + ", попытка " + runIndex
                 + ", time=" + wallTime.ToString("0.###", invariant) + "s"
                 + ", frames=" + frames
+                + ", activated=" + activated
                 + ", created=" + created
                 + ", solidified=" + solidified
+                + ", balance=" + (solidAfter - solidBefore)
                 + ", CPU p95=" + FStatic(Percentile(stats.cpuFrameMs, 0.95f)) + " ms"
                 + ", GPU p95=" + FStatic(Percentile(stats.gpuFrameMs, 0.95f)) + " ms"
                 + ", timeout=" + timedOut + ".");
@@ -1355,6 +1336,10 @@ namespace MeteoriteSPH3D
                 if (coarseRatio > Mathf.Max(1.0f, coarseGridParticleMultiplierDeadZone))
                     particleCopiesPerVoxel = Mathf.Clamp(Mathf.CeilToInt(coarseRatio), 1, copyLimit);
             }
+            if (enforceOneParticlePerActivatedVoxelForBenchmark)
+            {
+                particleCopiesPerVoxel = 1;
+            }
 
             float particleBudgetScale = Mathf.Max(1f, horizontalVoxelScale * horizontalVoxelScale * Mathf.Max(1f, verticalVoxelScale));
 
@@ -1375,11 +1360,27 @@ namespace MeteoriteSPH3D
             int requestedMaxCreated = Mathf.Max(baseConfig.maxCreatedParticlesPerImpact, SafeRoundToInt(baseConfig.maxCreatedParticlesPerImpact * particleLoadScale));
             int requestedCandidateCapacity = Mathf.Max(baseConfig.gpuDepositCandidateCapacity, SafeRoundToInt(baseConfig.gpuDepositCandidateCapacity * Mathf.Max(1f, horizontalVoxelScale * horizontalVoxelScale * Mathf.Max(1, particleCopiesPerVoxel))));
 
+            if (removeBenchmarkParticleCaps)
+            {
+                int expandedCapacity = EstimateImpactParticleCapacity(sizeScale, worldCellScale);
+                requestedMaxCreated = Mathf.Max(requestedMaxCreated, expandedCapacity);
+                requestedMaxParticles = Mathf.Max(requestedMaxParticles, Mathf.Min(Mathf.Max(1, maxExpandedBenchmarkParticles), expandedCapacity + 50000));
+                requestedCandidateCapacity = Mathf.Max(requestedCandidateCapacity, Mathf.Min(Mathf.Max(baseConfig.gpuDepositCandidateCapacity, hardGpuDepositCandidateCapacityBenchmark), Mathf.Max(262144, requestedMaxCreated / 4)));
+            }
+
             if (tdrSafeBenchmarkMode)
             {
-                requestedMaxParticles = Mathf.Min(requestedMaxParticles, hardParticleCap);
-                requestedMaxCreated = Mathf.Min(requestedMaxCreated, hardCreatedCap);
-                requestedCandidateCapacity = Mathf.Min(requestedCandidateCapacity, Mathf.Max(baseConfig.gpuDepositCandidateCapacity, hardGpuDepositCandidateCapacityBenchmark));
+                if (!removeBenchmarkParticleCaps)
+                {
+                    requestedMaxParticles = Mathf.Min(requestedMaxParticles, hardParticleCap);
+                    requestedMaxCreated = Mathf.Min(requestedMaxCreated, hardCreatedCap);
+                    requestedCandidateCapacity = Mathf.Min(requestedCandidateCapacity, Mathf.Max(baseConfig.gpuDepositCandidateCapacity, hardGpuDepositCandidateCapacityBenchmark));
+                }
+                else
+                {
+                    requestedMaxParticles = Mathf.Min(requestedMaxParticles, Mathf.Max(1, maxExpandedBenchmarkParticles));
+                    requestedMaxCreated = Mathf.Min(requestedMaxCreated, Mathf.Max(1, maxExpandedBenchmarkParticles));
+                }
 
                 if (sizeScale >= Mathf.Max(0.01f, tdrSafeScaleThreshold))
                 {
@@ -1403,7 +1404,7 @@ namespace MeteoriteSPH3D
                     + ". Радиус удара=" + F(controller.impactRadius)
                     + ", shockDepth=" + F(controller.shockDepth)
                     + ", terrain=" + controller.terrainWidth + "x" + controller.terrainHeight + "x" + controller.terrainDepth
-                    + ", cellSize=" + F(controller.cellSize) + ".");
+                    + ", cellSize=" + F(controller.cellSize) + ", heightMultiplier=" + F(benchmarkTerrainHeightMultiplier) + ".");
             }
 
             if (verboseConsoleProgress && particleCopiesPerVoxel > 1)
@@ -1420,9 +1421,28 @@ namespace MeteoriteSPH3D
                     + ", maxGpuIterations=" + controller.maxGpuSimulationIterationsPerFrame
                     + ", gridCellCap=" + controller.gpuGridMaxParticlesPerCell
                     + ", maxCreated=" + controller.maxCreatedParticlesPerImpact
-                    + ", maxParticles=" + controller.maxParticles + ".");
+                    + ", maxParticles=" + controller.maxParticles
+                    + (removeBenchmarkParticleCaps ? ", particleCap=REMOVED" : ", particleCap=TDR_SAFE") + ".");
             }
             return true;
+        }
+
+        private int EstimateImpactParticleCapacity(float sizeScale, float worldCellScale)
+        {
+            int emergencyCap = Mathf.Max(baseConfig.maxCreatedParticlesPerImpact, maxExpandedBenchmarkParticles);
+            if (!removeBenchmarkParticleCaps) return Mathf.Min(emergencyCap, hardMaxCreatedParticlesPerBenchmarkImpact);
+
+            float cell = Mathf.Max(0.0001f, baseConfig.cellSize * Mathf.Max(0.0001f, worldCellScale));
+            float radiusWorld = Mathf.Max(0.0001f, baseConfig.impactRadius * Mathf.Max(0.01f, sizeScale));
+            float rxCells = radiusWorld / cell;
+            float rzCells = rxCells;
+            float ryCells = Mathf.Max(1f, rxCells * Mathf.Clamp(controller.impactVerticalScale, 0.15f, 1.0f));
+
+            double ellipsoidCells = (4.0 / 3.0) * Math.PI * (double)rxCells * (double)ryCells * (double)rzCells;
+            double reservedCells = ellipsoidCells * Mathf.Clamp(impactVolumeParticleCapacityFraction, 0.05f, 1.0f);
+            if (reservedCells >= emergencyCap) return emergencyCap;
+            if (reservedCells <= baseConfig.maxCreatedParticlesPerImpact) return baseConfig.maxCreatedParticlesPerImpact;
+            return Mathf.Clamp(SafeRoundToInt((float)reservedCells), baseConfig.maxCreatedParticlesPerImpact, emergencyCap);
         }
 
         private void ComputeTerrainDimensions(float sizeScale, float horizontalVoxelScale, float verticalVoxelScale, float worldCellScale, out int width, out int height, out int depth, out int baseHeight, out int reliefAmplitude, out float finalVerticalVoxelScale, out float appliedVoxelScale)
@@ -1433,6 +1453,7 @@ namespace MeteoriteSPH3D
             if (terrainHeightScaleMode == TerrainHeightScaleMode.CraterDepthBudget)
             {
                 height = ComputeCraterDepthScaledHeight(sizeScale, worldCellScale, out baseHeight, out reliefAmplitude);
+                ApplyBenchmarkHeightMultiplier(ref height, ref baseHeight, ref reliefAmplitude);
                 finalVerticalVoxelScale = height / Mathf.Max(1f, (float)baseConfig.terrainHeight);
                 appliedVoxelScale = horizontalVoxelScale;
             }
@@ -1441,9 +1462,20 @@ namespace MeteoriteSPH3D
                 height = Mathf.Max(8, Mathf.RoundToInt(baseConfig.terrainHeight * verticalVoxelScale));
                 baseHeight = Mathf.Clamp(Mathf.RoundToInt(baseConfig.baseHeight * verticalVoxelScale), 1, height - 2);
                 reliefAmplitude = Mathf.Max(1, Mathf.RoundToInt(baseConfig.reliefAmplitudeCells * verticalVoxelScale));
+                ApplyBenchmarkHeightMultiplier(ref height, ref baseHeight, ref reliefAmplitude);
                 finalVerticalVoxelScale = height / Mathf.Max(1f, (float)baseConfig.terrainHeight);
                 appliedVoxelScale = horizontalVoxelScale;
             }
+        }
+
+        private void ApplyBenchmarkHeightMultiplier(ref int height, ref int baseHeight, ref int reliefAmplitude)
+        {
+            float k = Mathf.Clamp(benchmarkTerrainHeightMultiplier, 0.10f, 1.0f);
+            if (Mathf.Abs(k - 1.0f) < 0.0001f) return;
+
+            height = Mathf.Max(8, Mathf.RoundToInt(height * k));
+            baseHeight = Mathf.Clamp(Mathf.RoundToInt(baseHeight * k), 1, height - 2);
+            reliefAmplitude = Mathf.Clamp(Mathf.RoundToInt(reliefAmplitude * k), 1, Mathf.Max(1, height - 2));
         }
 
         private int ComputeCraterDepthScaledHeight(float sizeScale, float worldCellScale, out int scaledBaseHeight, out int scaledReliefAmplitude)
