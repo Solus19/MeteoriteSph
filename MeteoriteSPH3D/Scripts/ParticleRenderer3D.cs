@@ -68,7 +68,7 @@ namespace MeteoriteSPH3D
         private void LateUpdate()
         {
             MeteoriteSPH3DController c = MeteoriteSPH3DController.Instance;
-            if (c == null) return;
+            if (c == null || !c.ShouldRenderParticles) return;
             if (c.UseGpuSimulation && c.GpuParticleBuffer != null)
             {
                 DrawGpu(c);

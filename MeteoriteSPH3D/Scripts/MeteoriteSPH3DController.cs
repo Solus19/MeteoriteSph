@@ -42,7 +42,7 @@ namespace MeteoriteSPH3D
         [Header("GPU simulation")]
         public bool useGpuSimulation = true;
         public int gpuGridMaxParticlesPerCell = 96;
-        public int gpuReadbackInterval = 3;
+        public int gpuReadbackInterval = 4;
         [Tooltip("Use AsyncGPUReadback for particle state transfer. This avoids blocking the render thread while GPU particles are copied back for deposition.")]
         public bool useAsyncGpuReadback = true;
         [Tooltip("When enabled, GPU directly chooses deposit cells and deactivates settled particles. CPU only mirrors the resulting voxel cells for rendering. This removes the expensive CPU FindDepositCell tail scan.")]
@@ -73,13 +73,61 @@ namespace MeteoriteSPH3D
         public int gpuCompactMinInactiveCount = 12000;
         public int gpuCompactCooldownFrames = 45;
         [Tooltip("Rebuild the visible voxel mesh only once per N frames while particles are freezing. Higher values reduce lag during deposition.")]
-        public int terrainMeshRebuildInterval = 1;
+        public int terrainMeshRebuildInterval = 3;
         [Tooltip("Voxel chunk side size used by the terrain renderer. 16 is a good default for this prototype.")]
-        public int terrainChunkSize = 12;
+        public int terrainChunkSize = 24;
         [Tooltip("Maximum number of voxel chunks rebuilt in one frame. Lower values reduce spikes; higher values update terrain faster.")]
-        public int maxTerrainChunkRebuildsPerFrame = 24;
+        public int maxTerrainChunkRebuildsPerFrame = 6;
         [Tooltip("MeshCollider for rebuilt chunks is refreshed only once per N frames. Physics particles use the voxel buffer, so visual mesh can update more often than colliders.")]
         public int terrainColliderUpdateInterval = 60;
+
+        [Header("Dynamic terrain shadows")]
+        [Tooltip("Keep realtime terrain chunk shadows disabled while particles are active, then enable them after the simulation fully settles.")]
+        public bool enableTerrainShadowsWhenParticlesStop = true;
+        [Tooltip("Useful only for screenshots. Keep false for stable FPS while particles are flying/depositing.")]
+        public bool terrainShadowsDuringActiveParticles = false;
+        [Tooltip("How many consecutive frames with zero active particles must pass before terrain chunk shadows are enabled.")]
+        public int terrainShadowEnableDelayFrames = 2;
+
+        [Header("Final visual quality after particles stop")]
+        [Tooltip("Use cheaper lighting while particles are active, then restore the original high-quality shadow settings after all particles settle.")]
+        public bool restoreHighQualityLightingWhenParticlesStop = true;
+        public float activeShadowDistance = 140f;
+        public ShadowResolution activeShadowResolution = ShadowResolution.Medium;
+        public int activeShadowCascades = 1;
+        public int activeMainLightShadowmapResolution = 2048;
+        public LightShadows activeDirectionalLightShadows = LightShadows.Hard;
+        public float settledShadowDistance = 440f;
+        public ShadowResolution settledShadowResolution = ShadowResolution.High;
+        public int settledShadowCascades = 2;
+        public int settledMainLightShadowmapResolution = 4096;
+        public LightShadows settledDirectionalLightShadows = LightShadows.Soft;
+        [Tooltip("After all particles settle, force one final terrain rebuild with screenshot-quality terrain renderer options.")]
+        public bool restoreTerrainRenderWhenParticlesStop = true;
+        [Tooltip("Keep the optimized heightfield terrain mesh in final mode. Disable only if you explicitly want the very expensive full voxel mesh.")]
+        public bool finalUseHeightfieldMeshing = true;
+        [Tooltip("Optional vertex-color shadowing pass for final terrain. Rebuilds once after particles stop and improves crater readability.")]
+        public bool finalUseBakedDirectionalTerrainShadows = true;
+        public bool activeUseHeightfieldMeshing = true;
+        public bool activeUseBakedDirectionalTerrainShadows = false;
+
+        [Header("Deferred visual apply")]
+        [Tooltip("After click, run the particle/deposition algorithm invisibly and keep the old terrain mesh on screen. When all particles settle, apply all terrain changes with one final rebuild.")]
+        public bool deferVisualApplyUntilParticlesStop = true;
+        [Tooltip("Do not draw particles while deferred visual apply is active. The simulation still runs on GPU/CPU.")]
+        public bool hideParticlesDuringDeferredApply = true;
+        [Tooltip("During deferred visual apply, write deposits into the GPU terrain copy instead of mirroring every voxel to CPU terrain.")]
+        public bool forceGpuDirectDepositionDuringDeferredApply = true;
+        [Tooltip("Keep terrain changes in the GPU terrain copy while deferred visual apply is active, then download that terrain to CPU once particles reach zero.")]
+        public bool useDeferredGpuTerrainCopy = true;
+        [Tooltip("Legacy mode: store particles and place them only at final commit. This can diverge from the normal rendered simulation because intermediate deposits do not affect later collisions. Keep false for matching results.")]
+        public bool useCpuFinalDepositionForDeferredVisualApply = false;
+        [Tooltip("When the hidden run finishes, rebuild all terrain chunks immediately in one final visible update.")]
+        public bool rebuildTerrainImmediatelyAfterDeferredApply = true;
+        [Tooltip("How many consecutive zero-active-particle frames must pass before committing the deferred terrain changes.")]
+        public int deferredApplyZeroParticleDelayFrames = 2;
+        [Tooltip("When false, deferred visual apply never downloads/rebuilds the final terrain. Used by hidden benchmarks that finish at zero particles and then reset without changing the visible scene.")]
+        public bool deferredVisualCommitEnabled = true;
 
         [Header("Impact")]
         public float impactRadius = 17.20f;
@@ -257,12 +305,31 @@ namespace MeteoriteSPH3D
         public float sculptRimTemperature = 95f;
 
         [Header("Center capture")]
-        public bool centerCaptureEnabled = true;
+        public bool centerCaptureEnabled = false;
         public float centerCaptureRadiusFactor = 0.36f;
         public float centerCaptureMaxSpeed = 1.55f;
         public float centerCaptureMinAge = 1.15f;
         public float centerCaptureTemperatureBonus = 70f;
         public float centerDepositBias = 0.55f;
+
+        [Header("Crater interior cleanup")]
+        [Tooltip("Legacy hard guard against central mounds. Keep it disabled for final screenshots: center material is allowed, then smoothed instead of being blocked.")]
+        public bool preventInnerCraterPileup = false;
+        [Tooltip("Legacy radius for the hard center block. Used only when preventInnerCraterPileup is enabled.")]
+        [Range(0.05f, 0.95f)] public float innerCraterDepositBlockRadiusFactor = 0.52f;
+        [Tooltip("Legacy removal of old particles in the crater center. Disabled by default because it makes an empty hole instead of smooth deposited material.")]
+        public bool discardOldParticlesInsideInnerCrater = false;
+        public float innerCraterDiscardMinAge = 1.8f;
+        public float innerCraterDiscardMaxSpeed = 18f;
+        [Tooltip("After the hidden GPU run is committed, spread excessive deposited voxels inside the crater bowl so the center can contain material without forming pillars.")]
+        public bool smoothInnerCraterDeposits = true;
+        [Range(0.10f, 0.95f)] public float innerCraterSmoothRadiusFactor = 0.62f;
+        [Tooltip("Allowed height above the average of neighbouring columns before a deposited top voxel is moved to a lower nearby cell.")]
+        public float innerCraterMaxProminenceCells = 0.85f;
+        public int innerCraterSmoothPasses = 16;
+        public int innerCraterMoveRadiusCells = 5;
+        public int innerCraterMaxMovesPerColumnPerPass = 2;
+        public bool innerCraterSmoothOnlyDepositedVoxels = true;
 
         public List<SPHParticle3D> Particles { get { return particles; } }
         public bool UseGpuSimulation { get { return useGpuSimulation && gpuSolver != null && gpuSolver.IsReady; } }
@@ -271,6 +338,11 @@ namespace MeteoriteSPH3D
         public int GpuParticleDrawCount { get { return UseGpuSimulation ? gpuSolver.ActiveCount : particles.Count; } }
         public int SolidVoxelCount { get { return terrain != null ? terrain.SolidCount : 0; } }
         public bool IsPaused { get { return paused; } }
+        public bool ShouldRenderParticles { get { return !(deferVisualApplyUntilParticlesStop && hideParticlesDuringDeferredApply && deferredVisualApplyActive); } }
+        public bool IsDeferredVisualApplyActive { get { return deferVisualApplyUntilParticlesStop && deferredVisualApplyActive; } }
+        public bool HasActiveImpact { get { return hasImpact; } }
+        public Vector3 LastImpactCenter { get { return lastImpactCenter; } }
+        public float LastImpactRadius { get { return lastImpactRadius; } }
 
         public float LastFrameMs { get; private set; }
         public float LastControllerUpdateMs { get; private set; }
@@ -288,7 +360,10 @@ namespace MeteoriteSPH3D
 
         private VoxelTerrain3D terrain;
         private readonly List<SPHParticle3D> particles = new List<SPHParticle3D>(8192);
+        private readonly List<SPHParticle3D> deferredCpuDepositCandidates = new List<SPHParticle3D>(32768);
+        private readonly HashSet<int> deferredCpuDepositGpuIndices = new HashSet<int>();
         private readonly List<GPUSPH3DSolver.DepositedVoxel> gpuDepositedVoxels = new List<GPUSPH3DSolver.DepositedVoxel>(8192);
+        private readonly List<GPUSPH3DSolver.DepositedVoxel> deferredGpuDepositedVoxels = new List<GPUSPH3DSolver.DepositedVoxel>(32768);
         private readonly List<int> pendingGpuDeactivateIndices = new List<int>(512);
         private readonly SPHSolver3D solver = new SPHSolver3D();
         private readonly GPUSPH3DSolver gpuSolver = new GPUSPH3DSolver();
@@ -302,6 +377,11 @@ namespace MeteoriteSPH3D
         private bool tailDepositionModeLatched;
         private bool gpuTerrainDirty;
         private bool lastGpuMode;
+        private int zeroActiveParticleShadowFrames;
+        private bool terrainChunkShadowsCurrentlyEnabled;
+        private bool finalVisualQualityCurrentlyEnabled;
+        private bool deferredVisualApplyActive;
+        private int deferredZeroActiveFrames;
 
         private VoxelMeshRenderer3D voxelRenderer;
         private ParticleRenderer3D particleRenderer;
@@ -360,15 +440,25 @@ namespace MeteoriteSPH3D
             voxelRenderer.Initialize();
             voxelRenderer.Configure(terrainChunkSize, maxTerrainChunkRebuildsPerFrame, terrainColliderUpdateInterval);
             voxelRenderer.RebuildImmediate(terrain);
+            zeroActiveParticleShadowFrames = Mathf.Max(0, terrainShadowEnableDelayFrames);
+            UpdateTerrainChunkShadowMode(true);
 
             GameObject particlesGo = new GameObject("SPH Particles 3D");
             particleRenderer = particlesGo.AddComponent<ParticleRenderer3D>();
             particleRenderer.Initialize(particleRadius);
 
             // No runtime parameter menu: all tuning is done through inspector/defaults.
-            if (GetComponent<MeteoriteSPH3DBenchmark>() == null)
+            // The old continuous CSV benchmark is intentionally NOT auto-added here,
+            // because it records in parallel and can confuse/slow down the new auto-impact benchmark.
+            MeteoriteSPH3DBenchmark legacyBenchmark = GetComponent<MeteoriteSPH3DBenchmark>();
+            if (legacyBenchmark != null)
             {
-                gameObject.AddComponent<MeteoriteSPH3DBenchmark>();
+                legacyBenchmark.recordOnStart = false;
+                legacyBenchmark.enabled = false;
+            }
+            if (GetComponent<MeteoriteSPH3DAutoImpactBenchmark>() == null)
+            {
+                gameObject.AddComponent<MeteoriteSPH3DAutoImpactBenchmark>();
             }
         }
 
@@ -381,17 +471,11 @@ namespace MeteoriteSPH3D
             // Real shadow maps are enabled here. The voxel chunks below have
             // Cast Shadows and Receive Shadows enabled, and the vertex-color shader
             // now has proper Built-in + URP shadow passes.
-            QualitySettings.shadows = ShadowQuality.All;
-            QualitySettings.shadowDistance = 440f;
-            QualitySettings.shadowResolution = ShadowResolution.High;
-            QualitySettings.shadowCascades = 2;
-            QualitySettings.shadowProjection = ShadowProjection.StableFit;
-            TryConfigureUrpShadows();
+            ApplyLightingQuality(true, true);
 
             Light key = GetOrCreateDirectionalLight("Voxel Key Light");
             key.color = new Color(1f, 0.96f, 0.88f, 1f);
             key.intensity = 1.12f;
-            key.shadows = LightShadows.Soft;
             key.shadowStrength = 0.96f;
             key.shadowBias = 0.006f;
             key.shadowNormalBias = 0.035f;
@@ -408,7 +492,41 @@ namespace MeteoriteSPH3D
             fill.transform.rotation = Quaternion.Euler(18f, 132f, 0f);
         }
 
-        private static void TryConfigureUrpShadows()
+        private void ApplyLightingQuality(bool settledQuality, bool force = false)
+        {
+            if (!force && finalVisualQualityCurrentlyEnabled == settledQuality) return;
+
+            finalVisualQualityCurrentlyEnabled = settledQuality;
+
+            bool useSettled = settledQuality && restoreHighQualityLightingWhenParticlesStop;
+            float distance = useSettled ? settledShadowDistance : activeShadowDistance;
+            ShadowResolution resolution = useSettled ? settledShadowResolution : activeShadowResolution;
+            int cascades = Mathf.Clamp(useSettled ? settledShadowCascades : activeShadowCascades, 0, 4);
+            int shadowmap = Mathf.Max(256, useSettled ? settledMainLightShadowmapResolution : activeMainLightShadowmapResolution);
+            LightShadows lightShadows = useSettled ? settledDirectionalLightShadows : activeDirectionalLightShadows;
+
+            QualitySettings.shadows = ShadowQuality.All;
+            QualitySettings.shadowDistance = distance;
+            QualitySettings.shadowResolution = resolution;
+            QualitySettings.shadowCascades = cascades;
+            QualitySettings.shadowProjection = ShadowProjection.StableFit;
+            TryConfigureUrpShadows(distance, shadowmap, cascades, lightShadows == LightShadows.Soft);
+
+            Light key = GetOrCreateDirectionalLight("Voxel Key Light");
+            key.shadows = lightShadows;
+        }
+
+        private void ApplyTerrainRenderQuality(bool settledQuality, bool forceRebuild)
+        {
+            if (voxelRenderer == null) return;
+
+            bool useFinal = settledQuality && restoreTerrainRenderWhenParticlesStop;
+            bool useHeightfield = useFinal ? finalUseHeightfieldMeshing : activeUseHeightfieldMeshing;
+            bool useBakedShadows = useFinal ? finalUseBakedDirectionalTerrainShadows : activeUseBakedDirectionalTerrainShadows;
+            voxelRenderer.SetTerrainRenderQuality(useHeightfield, useBakedShadows, terrain, forceRebuild);
+        }
+
+        private static void TryConfigureUrpShadows(float shadowDistance, int shadowmapResolution, int cascadeCount, bool softShadows)
         {
             // If the host project uses URP, its asset can silently disable main-light shadows.
             // Use reflection so this folder still compiles in Built-in projects without a URP assembly reference.
@@ -420,14 +538,14 @@ namespace MeteoriteSPH3D
 
             SetFieldOrProperty(asset, type, "m_MainLightShadowsSupported", true);
             SetFieldOrProperty(asset, type, "supportsMainLightShadows", true);
-            SetFieldOrProperty(asset, type, "m_SoftShadowsSupported", true);
-            SetFieldOrProperty(asset, type, "supportsSoftShadows", true);
-            SetFieldOrProperty(asset, type, "m_ShadowDistance", 440f);
-            SetFieldOrProperty(asset, type, "shadowDistance", 440f);
-            SetFieldOrProperty(asset, type, "m_MainLightShadowmapResolution", 4096);
-            SetFieldOrProperty(asset, type, "mainLightShadowmapResolution", 4096);
-            SetFieldOrProperty(asset, type, "m_ShadowCascadeCount", 2);
-            SetFieldOrProperty(asset, type, "shadowCascadeCount", 2);
+            SetFieldOrProperty(asset, type, "m_SoftShadowsSupported", softShadows);
+            SetFieldOrProperty(asset, type, "supportsSoftShadows", softShadows);
+            SetFieldOrProperty(asset, type, "m_ShadowDistance", shadowDistance);
+            SetFieldOrProperty(asset, type, "shadowDistance", shadowDistance);
+            SetFieldOrProperty(asset, type, "m_MainLightShadowmapResolution", shadowmapResolution);
+            SetFieldOrProperty(asset, type, "mainLightShadowmapResolution", shadowmapResolution);
+            SetFieldOrProperty(asset, type, "m_ShadowCascadeCount", cascadeCount);
+            SetFieldOrProperty(asset, type, "shadowCascadeCount", cascadeCount);
         }
 
         private static void SetFieldOrProperty(object target, System.Type type, string name, object value)
@@ -477,6 +595,63 @@ namespace MeteoriteSPH3D
             if (terrain != null) terrain.MarkAllDirty();
             terrainDirty = true;
             terrainMeshDirtyFrames = terrainMeshRebuildInterval;
+        }
+
+        public Vector3 GetDefaultBenchmarkImpactPoint()
+        {
+            if (terrain == null)
+            {
+                return new Vector3(terrainWidth * cellSize * 0.5f, baseHeight * cellSize, terrainDepth * cellSize * 0.5f);
+            }
+
+            int x = Mathf.Clamp(terrain.Width / 2, 0, terrain.Width - 1);
+            int z = Mathf.Clamp(terrain.Depth / 2, 0, terrain.Depth - 1);
+            int top = terrain.TopSolidY(x, z);
+            if (top < 0) top = Mathf.Clamp(baseHeight - 1, 0, terrain.Height - 1);
+
+            return new Vector3((x + 0.5f) * terrain.CellSize, (top + 1) * terrain.CellSize, (z + 0.5f) * terrain.CellSize);
+        }
+
+        public void ApplyBenchmarkImpact(Vector3 hitPoint)
+        {
+            ApplyImpact(hitPoint);
+        }
+
+        public void CancelDeferredVisualApplyWithoutCommit()
+        {
+            deferredVisualApplyActive = false;
+            deferredZeroActiveFrames = 0;
+            tailDepositionModeLatched = false;
+            solidifyScanCursor = -1;
+
+            deferredGpuDepositedVoxels.Clear();
+            deferredCpuDepositCandidates.Clear();
+            deferredCpuDepositGpuIndices.Clear();
+            pendingDeposits.Clear();
+            pendingGpuDeactivateIndices.Clear();
+            gpuDepositedVoxels.Clear();
+            depositionBatchFramesElapsed = 0;
+
+            particles.Clear();
+            if (UseGpuSimulation && gpuSolver != null && gpuSolver.IsReady)
+            {
+                gpuSolver.UploadFromParticles(particles);
+            }
+
+            gpuTerrainDirty = false;
+            gpuTerrainDirtyFrames = 0;
+            terrainDirty = false;
+            terrainMeshDirtyFrames = 0;
+        }
+
+        public void ReframeCameraToTerrain()
+        {
+            if (terrain == null) return;
+
+            Vector3 target = new Vector3(terrain.WorldWidth * 0.5f, terrain.WorldHeight * 0.25f, terrain.WorldDepth * 0.5f);
+            float distance = Mathf.Max(terrain.WorldWidth, terrain.WorldDepth) * 1.25f;
+            if (mainCamera != null) mainCamera.farClipPlane = Mathf.Max(800f, distance * 4.0f + terrain.WorldHeight);
+            if (cameraController != null) cameraController.Initialize(target, distance);
         }
 
         public int LayerAxisMax()
@@ -579,8 +754,13 @@ namespace MeteoriteSPH3D
             gpuCompactCooldownRemaining = 0;
             pendingGpuDeactivateIndices.Clear();
             gpuDepositedVoxels.Clear();
+            deferredGpuDepositedVoxels.Clear();
+            deferredCpuDepositCandidates.Clear();
+            deferredCpuDepositGpuIndices.Clear();
             pendingDeposits.Clear();
             depositionBatchFramesElapsed = 0;
+            deferredVisualApplyActive = false;
+            deferredZeroActiveFrames = 0;
             lastImpactInitialParticleCount = 0;
             tailDepositionModeLatched = false;
             LastCreatedParticles = 0;
@@ -597,6 +777,8 @@ namespace MeteoriteSPH3D
             LastGpuParticleUploadMs = 0f;
             LastMeshRebuildMs = 0f;
             lastGpuMode = UseGpuSimulation;
+            zeroActiveParticleShadowFrames = Mathf.Max(0, terrainShadowEnableDelayFrames);
+            UpdateTerrainChunkShadowMode(true);
             if (useGpuSimulation && gpuSolver.IsReady)
             {
                 gpuSolver.UploadTerrain(terrain);
@@ -707,7 +889,7 @@ namespace MeteoriteSPH3D
             forceDepositTemperatureBonus = 500f;
             forceDepositGroundSnapDistanceCells = 6f;
             forcedDepositSearchRadiusCells = 7;
-            gpuReadbackInterval = 3;
+            gpuReadbackInterval = 4;
             useAsyncGpuReadback = true;
             useGpuDirectDeposition = true;
             gpuDirectDepositionOnlyInTail = true;
@@ -726,10 +908,17 @@ namespace MeteoriteSPH3D
             gpuCompactInactiveRatio = 0.28f;
             gpuCompactMinInactiveCount = 12000;
             gpuCompactCooldownFrames = 45;
-            terrainMeshRebuildInterval = 1;
-            terrainChunkSize = 12;
-            maxTerrainChunkRebuildsPerFrame = 24;
+            terrainMeshRebuildInterval = 3;
+            terrainChunkSize = 24;
+            maxTerrainChunkRebuildsPerFrame = 6;
             terrainColliderUpdateInterval = 60;
+            deferVisualApplyUntilParticlesStop = true;
+            hideParticlesDuringDeferredApply = true;
+            forceGpuDirectDepositionDuringDeferredApply = true;
+            useDeferredGpuTerrainCopy = true;
+            useCpuFinalDepositionForDeferredVisualApply = false;
+            rebuildTerrainImmediatelyAfterDeferredApply = true;
+            deferredApplyZeroParticleDelayFrames = 2;
 
             rimCaptureEnabled = true;
             rimCaptureStartRadiusFactor = 0.58f;
@@ -758,12 +947,24 @@ namespace MeteoriteSPH3D
             sculptRimNoiseStrength = 0.22f;
             sculptRimTemperature = 95f;
 
-            centerCaptureEnabled = true;
+            centerCaptureEnabled = false;
             centerCaptureRadiusFactor = 0.36f;
             centerCaptureMaxSpeed = 1.55f;
             centerCaptureMinAge = 1.15f;
             centerCaptureTemperatureBonus = 70f;
             centerDepositBias = 0.55f;
+            preventInnerCraterPileup = false;
+            innerCraterDepositBlockRadiusFactor = 0.52f;
+            discardOldParticlesInsideInnerCrater = false;
+            innerCraterDiscardMinAge = 1.8f;
+            innerCraterDiscardMaxSpeed = 18f;
+            smoothInnerCraterDeposits = true;
+            innerCraterSmoothRadiusFactor = 0.62f;
+            innerCraterMaxProminenceCells = 0.85f;
+            innerCraterSmoothPasses = 16;
+            innerCraterMoveRadiusCells = 5;
+            innerCraterMaxMovesPerColumnPerPass = 2;
+            innerCraterSmoothOnlyDepositedVoxels = true;
         }
 
         private void Update()
@@ -852,11 +1053,11 @@ namespace MeteoriteSPH3D
                             if (completed)
                             {
                                 LastGpuReadbackMs += Time.realtimeSinceStartup * 1000f - readbackStartMs;
-                                ProcessGpuDepositedVoxels();
+                                HandleGpuDepositedVoxels();
                             }
 
                             readbackFrame++;
-                            if (readbackFrame >= Mathf.Max(1, gpuReadbackInterval) && !gpuSolver.IsGpuDepositReadbackPending)
+                            if (ActiveParticleCount > 0 && readbackFrame >= Mathf.Max(1, gpuReadbackInterval) && !gpuSolver.IsGpuDepositReadbackPending)
                             {
                                 readbackFrame = 0;
                                 gpuSolver.RequestGpuDepositReadback(this);
@@ -865,13 +1066,13 @@ namespace MeteoriteSPH3D
                         else
                         {
                             readbackFrame++;
-                            if (readbackFrame >= Mathf.Max(1, gpuReadbackInterval))
+                            if (ActiveParticleCount > 0 && readbackFrame >= Mathf.Max(1, gpuReadbackInterval))
                             {
                                 readbackFrame = 0;
                                 float readbackStartMs = Time.realtimeSinceStartup * 1000f;
                                 gpuSolver.DownloadGpuDeposits(this, gpuDepositedVoxels);
                                 LastGpuReadbackMs += Time.realtimeSinceStartup * 1000f - readbackStartMs;
-                                ProcessGpuDepositedVoxels();
+                                HandleGpuDepositedVoxels();
                             }
                         }
                     }
@@ -943,7 +1144,9 @@ namespace MeteoriteSPH3D
                 UploadDirtyTerrainIfDue();
             }
 
-            if (terrainDirty && voxelRenderer != null)
+            TryCommitDeferredVisualApplyIfFinished();
+
+            if (terrainDirty && voxelRenderer != null && !IsDeferredVisualApplyActive)
             {
                 terrainMeshDirtyFrames++;
                 int meshInterval = GetEffectiveTerrainMeshRebuildInterval();
@@ -963,17 +1166,127 @@ namespace MeteoriteSPH3D
                 particleRenderer.SetRadius(particleRadius);
             }
 
+            UpdateTerrainChunkShadowMode();
+
             LastControllerUpdateMs = Time.realtimeSinceStartup * 1000f - updateStartMs;
         }
 
 
 
+        private void UpdateTerrainChunkShadowMode(bool force = false)
+        {
+            if (voxelRenderer == null) return;
+
+            bool particlesActive = ActiveParticleCount > 0 || IsDeferredVisualApplyActive;
+            if (particlesActive)
+            {
+                zeroActiveParticleShadowFrames = 0;
+            }
+            else
+            {
+                zeroActiveParticleShadowFrames++;
+            }
+
+            bool settledQuality = !particlesActive && zeroActiveParticleShadowFrames >= Mathf.Max(0, terrainShadowEnableDelayFrames);
+
+            bool shouldEnableChunkShadows = terrainShadowsDuringActiveParticles;
+            if (settledQuality && enableTerrainShadowsWhenParticlesStop)
+            {
+                shouldEnableChunkShadows = true;
+            }
+
+            bool visualModeChanged = force || terrainChunkShadowsCurrentlyEnabled != shouldEnableChunkShadows || finalVisualQualityCurrentlyEnabled != settledQuality;
+            if (!visualModeChanged) return;
+
+            terrainChunkShadowsCurrentlyEnabled = shouldEnableChunkShadows;
+            voxelRenderer.SetRealtimeChunkShadows(shouldEnableChunkShadows);
+
+            ApplyLightingQuality(settledQuality, force);
+            ApplyTerrainRenderQuality(settledQuality, settledQuality && visualModeChanged);
+        }
+
+        private bool UseDeferredGpuTerrainCopyMode()
+        {
+            return useDeferredGpuTerrainCopy && IsDeferredVisualApplyActive && UseGpuSimulation && gpuSolver != null && gpuSolver.IsReady;
+        }
+
         private bool UseDirectGpuDepositionThisFrame()
         {
-            if (!UseGpuSimulation || !useGpuDirectDeposition) return false;
+            if (!UseGpuSimulation) return false;
+            if (IsDeferredVisualApplyActive)
+            {
+                if (useCpuFinalDepositionForDeferredVisualApply) return false;
+                if (forceGpuDirectDepositionDuringDeferredApply) return true;
+            }
+            if (!useGpuDirectDeposition) return false;
             return !gpuDirectDepositionOnlyInTail || IsTailDepositModeActive();
         }
 
+        private void HandleGpuDepositedVoxels()
+        {
+            if (UseDeferredGpuTerrainCopyMode())
+            {
+                // In deferred mode the compute shader already changed _TerrainSolid and
+                // _TerrainTopSolidY. Do not mirror every deposited voxel to CPU terrain here: the
+                // visible terrain stays frozen until the final one-shot GPU terrain download.
+                int placed = gpuDepositedVoxels.Count;
+                if (placed > 0)
+                {
+                    LastSolidifiedParticles += placed;
+                    TotalSolidifiedParticles += placed;
+                }
+                gpuDepositedVoxels.Clear();
+                return;
+            }
+
+            ProcessGpuDepositedVoxels();
+        }
+
+        private void AccumulateDeferredGpuDeposits()
+        {
+            if (gpuDepositedVoxels.Count == 0) return;
+
+            float startMs = Time.realtimeSinceStartup * 1000f;
+            for (int i = 0; i < gpuDepositedVoxels.Count; i++)
+            {
+                deferredGpuDepositedVoxels.Add(gpuDepositedVoxels[i]);
+            }
+            gpuDepositedVoxels.Clear();
+            LastSolidifyMs += Time.realtimeSinceStartup * 1000f - startMs;
+        }
+
+
+        private int ApplyDeferredCpuFinalDeposition()
+        {
+            if (terrain == null || deferredCpuDepositCandidates.Count == 0) return 0;
+
+            int placed = 0;
+            bool tailForcedDeposit = tailDepositionModeLatched;
+            for (int i = 0; i < deferredCpuDepositCandidates.Count; i++)
+            {
+                SPHParticle3D p = deferredCpuDepositCandidates[i];
+                if (p == null) continue;
+
+                float speed = p.velocity.magnitude;
+                if (ShouldDiscardInnerCraterParticle(p, speed)) continue;
+
+                bool normal = p.age >= solidifyMinAge && p.temperature <= solidifyTemperature && speed <= solidifySpeed && p.recentGroundContact > 0f;
+                bool center = IsCenterCaptureAllowed(p, speed);
+                bool rim = IsRimCaptureAllowed(p, speed);
+                bool forced = tailForcedDeposit || IsForcedDepositAllowed(p, speed);
+                if (!(normal || center || rim || forced)) continue;
+
+                Vector3Int deposit;
+                if (!FindDepositCell(p.position, rim, center, forced, out deposit)) continue;
+
+                float depositTemperature = Mathf.Min(p.temperature, sculptRimTemperature);
+                placed += DepositParticleMaterial(deposit, depositTemperature, rim, center, forced);
+            }
+
+            deferredCpuDepositCandidates.Clear();
+            deferredCpuDepositGpuIndices.Clear();
+            return placed;
+        }
 
         private void ProcessGpuDepositedVoxels()
         {
@@ -1017,10 +1330,118 @@ namespace MeteoriteSPH3D
             TryCompactGpuParticles();
         }
 
+        private void TryCommitDeferredVisualApplyIfFinished()
+        {
+            if (!IsDeferredVisualApplyActive) return;
+            if (!deferredVisualCommitEnabled) return;
+
+            if (ActiveParticleCount > 0 || gpuSolver.IsGpuDepositReadbackPending || gpuSolver.IsDepositCandidateReadbackPending || gpuSolver.IsReadbackPending)
+            {
+                deferredZeroActiveFrames = 0;
+                return;
+            }
+
+            deferredZeroActiveFrames++;
+            if (deferredZeroActiveFrames < Mathf.Max(0, deferredApplyZeroParticleDelayFrames)) return;
+
+            CommitDeferredVisualApply();
+        }
+
+        private void CommitDeferredVisualApply()
+        {
+            if (!deferredVisualApplyActive) return;
+
+            float startMs = Time.realtimeSinceStartup * 1000f;
+
+            bool gpuTerrainDownloaded = false;
+            if (useDeferredGpuTerrainCopy && UseGpuSimulation && gpuSolver != null && gpuSolver.IsReady && terrain != null)
+            {
+                float terrainDownloadStartMs = Time.realtimeSinceStartup * 1000f;
+                gpuSolver.DownloadTerrainTo(terrain, true);
+                LastGpuReadbackMs += Time.realtimeSinceStartup * 1000f - terrainDownloadStartMs;
+                gpuTerrainDownloaded = true;
+            }
+
+            if (!gpuTerrainDownloaded)
+            {
+                // Fallback for CPU mode / unsupported GPU mode.
+                FlushPendingDeposits(true);
+            }
+            else
+            {
+                pendingDeposits.Clear();
+                depositionBatchFramesElapsed = 0;
+                gpuTerrainDirty = false;
+                gpuTerrainDirtyFrames = 0;
+            }
+
+            int smoothedInnerCraterVoxels = SmoothInnerCraterDepositsIfNeeded();
+            if (smoothedInnerCraterVoxels > 0)
+            {
+                terrainDirty = true;
+            }
+
+            deferredGpuDepositedVoxels.Clear();
+            deferredCpuDepositCandidates.Clear();
+            deferredCpuDepositGpuIndices.Clear();
+
+            particles.Clear();
+            pendingGpuDeactivateIndices.Clear();
+            gpuDepositedVoxels.Clear();
+            if (UseGpuSimulation && gpuSolver.IsReady)
+            {
+                gpuSolver.UploadFromParticles(particles);
+            }
+
+            deferredVisualApplyActive = false;
+            deferredZeroActiveFrames = 0;
+            tailDepositionModeLatched = false;
+            solidifyScanCursor = -1;
+
+            if (terrain != null) terrain.MarkAllDirty();
+            terrainDirty = true;
+            terrainMeshDirtyFrames = GetEffectiveTerrainMeshRebuildInterval();
+
+            ApplyLightingQuality(true, true);
+            if (voxelRenderer != null)
+            {
+                terrainChunkShadowsCurrentlyEnabled = enableTerrainShadowsWhenParticlesStop;
+                voxelRenderer.SetRealtimeChunkShadows(enableTerrainShadowsWhenParticlesStop);
+                ApplyTerrainRenderQuality(true, false);
+                if (rebuildTerrainImmediatelyAfterDeferredApply)
+                {
+                    float meshStartMs = Time.realtimeSinceStartup * 1000f;
+                    voxelRenderer.RebuildImmediate(terrain);
+                    LastMeshRebuildMs += Time.realtimeSinceStartup * 1000f - meshStartMs;
+                    terrainDirty = false;
+                    terrainMeshDirtyFrames = 0;
+                }
+            }
+
+            LastSolidifyMs += Time.realtimeSinceStartup * 1000f - startMs;
+        }
+
 
         private void ProcessDownloadedGpuParticles(bool readbackWasAsync, bool partialCandidateReadback = false)
         {
             int before = particles.Count;
+
+            if (IsDeferredVisualApplyActive && useCpuFinalDepositionForDeferredVisualApply && partialCandidateReadback)
+            {
+                float collectStartMs = Time.realtimeSinceStartup * 1000f;
+                int collected = AccumulateDeferredCpuDepositCandidates();
+                LastSolidifyMs += Time.realtimeSinceStartup * 1000f - collectStartMs;
+
+                if (pendingGpuDeactivateIndices.Count > 0)
+                {
+                    gpuSolver.DeactivateParticles(pendingGpuDeactivateIndices);
+                    pendingGpuDeactivateIndices.Clear();
+                }
+
+                particles.Clear();
+                TryCompactGpuParticles();
+                return;
+            }
 
             float solidifyStartMs = Time.realtimeSinceStartup * 1000f;
             int solidified = SolidifyParticles();
@@ -1046,6 +1467,33 @@ namespace MeteoriteSPH3D
             }
 
             TryCompactGpuParticles();
+        }
+
+        private int AccumulateDeferredCpuDepositCandidates()
+        {
+            if (particles.Count == 0) return 0;
+
+            int collected = 0;
+            for (int i = 0; i < particles.Count; i++)
+            {
+                SPHParticle3D p = particles[i];
+                if (p == null || !p.active) continue;
+
+                int gpuIndex = p.gpuIndex;
+                if (gpuIndex >= 0 && !deferredCpuDepositGpuIndices.Add(gpuIndex)) continue;
+
+                SPHParticle3D copy = new SPHParticle3D(p.position, p.velocity, p.temperature, p.mass);
+                copy.age = p.age;
+                copy.recentGroundContact = p.recentGroundContact;
+                copy.gpuIndex = gpuIndex;
+                copy.active = true;
+                deferredCpuDepositCandidates.Add(copy);
+
+                if (gpuIndex >= 0) pendingGpuDeactivateIndices.Add(gpuIndex);
+                collected++;
+            }
+
+            return collected;
         }
 
 
@@ -1166,6 +1614,7 @@ namespace MeteoriteSPH3D
 
         private void TryCompactGpuParticles()
         {
+            if (IsDeferredVisualApplyActive) return;
             if (!UseGpuSimulation || !compactInactiveGpuParticles) return;
             if (gpuCompactCooldownRemaining > 0) return;
 
@@ -1192,6 +1641,7 @@ namespace MeteoriteSPH3D
         private void TryImpactFromMouse()
         {
             if (mainCamera == null) return;
+            if (IsDeferredVisualApplyActive) return;
             Ray ray = mainCamera.ScreenPointToRay(InputBridge3D.MousePosition());
 
             Vector3 voxelHit;
@@ -1305,6 +1755,11 @@ namespace MeteoriteSPH3D
         private void ApplyImpact(Vector3 hitPoint)
         {
             FlushPendingDeposits(true);
+            deferredGpuDepositedVoxels.Clear();
+            deferredCpuDepositCandidates.Clear();
+            deferredCpuDepositGpuIndices.Clear();
+            deferredVisualApplyActive = false;
+            deferredZeroActiveFrames = 0;
 
             // New impact appends particles on CPU. Sync once on click so we do not overwrite
             // the current GPU simulation with an older async readback snapshot.
@@ -1390,6 +1845,11 @@ namespace MeteoriteSPH3D
             TotalCreatedParticles += created;
             lastImpactInitialParticleCount = Mathf.Max(1, created);
             tailDepositionModeLatched = false;
+            if (deferVisualApplyUntilParticlesStop && created > 0)
+            {
+                deferredVisualApplyActive = true;
+                deferredZeroActiveFrames = 0;
+            }
 
             terrainDirty = true;
             terrainMeshDirtyFrames = terrainMeshRebuildInterval;
@@ -1405,6 +1865,8 @@ namespace MeteoriteSPH3D
                 gpuSolver.UploadFromParticles(particles);
                 LastGpuParticleUploadMs += Time.realtimeSinceStartup * 1000f - uploadParticlesStartMs;
             }
+
+            UpdateTerrainChunkShadowMode(true);
         }
 
         private int ComputeScaledRimHeightCells(float radius)
@@ -1551,6 +2013,14 @@ namespace MeteoriteSPH3D
                 }
 
                 float speed = p.velocity.magnitude;
+                if (ShouldDiscardInnerCraterParticle(p, speed))
+                {
+                    if (UseGpuSimulation && p.gpuIndex >= 0) pendingGpuDeactivateIndices.Add(p.gpuIndex);
+                    RemoveParticleAtSwap(i);
+                    i--;
+                    continue;
+                }
+
                 bool normal = p.age >= solidifyMinAge && p.temperature <= solidifyTemperature && speed <= solidifySpeed && p.recentGroundContact > 0f;
                 bool center = IsCenterCaptureAllowed(p, speed);
                 bool rim = IsRimCaptureAllowed(p, speed);
@@ -1634,6 +2104,165 @@ namespace MeteoriteSPH3D
             }
 
             return placed;
+        }
+
+        private bool IsInsideBlockedCraterInterior(Vector3 position)
+        {
+            if (!preventInnerCraterPileup || !hasImpact || lastImpactRadius <= 0.001f) return false;
+            Vector2 a = new Vector2(position.x - lastImpactCenter.x, position.z - lastImpactCenter.z);
+            float innerR = lastImpactRadius * Mathf.Clamp(innerCraterDepositBlockRadiusFactor, 0.05f, 0.95f);
+            return a.sqrMagnitude < innerR * innerR;
+        }
+
+        private bool IsInsideInnerCraterSmoothZone(Vector3 position)
+        {
+            if (!hasImpact || lastImpactRadius <= 0.001f) return false;
+            float r = Mathf.Max(cellSize, lastImpactRadius * Mathf.Clamp(innerCraterSmoothRadiusFactor, 0.10f, 0.95f));
+            Vector2 d = new Vector2(position.x - lastImpactCenter.x, position.z - lastImpactCenter.z);
+            return d.sqrMagnitude <= r * r;
+        }
+
+        private bool IsInsideInnerCraterSmoothZone(int x, int z)
+        {
+            if (terrain == null) return false;
+            Vector3 p = new Vector3((x + 0.5f) * terrain.CellSize, lastImpactCenter.y, (z + 0.5f) * terrain.CellSize);
+            return IsInsideInnerCraterSmoothZone(p);
+        }
+
+        private bool IsMovableDepositedTopVoxel(int x, int z, int topY)
+        {
+            if (terrain == null || topY < 0 || !terrain.InBounds(x, topY, z)) return false;
+            if (!innerCraterSmoothOnlyDepositedVoxels) return true;
+            VoxelCell3D c = terrain.Get(x, topY, z);
+            return c.solid && c.deposited;
+        }
+
+        private bool TryFindLowInnerCraterTarget(int sourceX, int sourceZ, int sourceTopY, out Vector3Int target)
+        {
+            target = Vector3Int.zero;
+            if (terrain == null) return false;
+
+            int radius = Mathf.Max(1, innerCraterMoveRadiusCells);
+            float bestScore = float.PositiveInfinity;
+            for (int dz = -radius; dz <= radius; dz++)
+            {
+                for (int dx = -radius; dx <= radius; dx++)
+                {
+                    if (dx == 0 && dz == 0) continue;
+                    int x = sourceX + dx;
+                    int z = sourceZ + dz;
+                    if (x < 0 || x >= terrain.Width || z < 0 || z >= terrain.Depth) continue;
+                    if (!IsInsideInnerCraterSmoothZone(x, z)) continue;
+
+                    float dist = Mathf.Sqrt(dx * dx + dz * dz);
+                    if (dist > radius + 0.01f) continue;
+
+                    int top = terrain.TopSolidY(x, z);
+                    if (top < 0 || top >= terrain.Height - 1) continue;
+                    if (top >= sourceTopY - 1) continue;
+
+                    float averageNeighbourTopY;
+                    int minNeighbourTopY;
+                    int maxNeighbourTopY;
+                    int neighbourTopCount;
+                    bool hasStats = TryNeighbourTopStats(x, z, out averageNeighbourTopY, out minNeighbourTopY, out maxNeighbourTopY, out neighbourTopCount);
+                    int candidateY = top + 1;
+                    if (hasStats)
+                    {
+                        float candidateProminence = candidateY - averageNeighbourTopY;
+                        if (candidateProminence > Mathf.Max(0.25f, innerCraterMaxProminenceCells) + 0.50f) continue;
+                    }
+
+                    int belowSupport = 0;
+                    for (int oz = -1; oz <= 1; oz++)
+                    {
+                        for (int ox = -1; ox <= 1; ox++)
+                        {
+                            if (terrain.IsSolid(x + ox, candidateY - 1, z + oz)) belowSupport++;
+                        }
+                    }
+                    if (belowSupport <= 0) continue;
+
+                    float score = top * 2.0f + dist * 0.35f;
+                    if (hasStats) score += Mathf.Max(0f, candidateY - averageNeighbourTopY) * 1.5f;
+                    if (score < bestScore)
+                    {
+                        bestScore = score;
+                        target = new Vector3Int(x, candidateY, z);
+                    }
+                }
+            }
+
+            return bestScore < float.PositiveInfinity;
+        }
+
+        private int SmoothInnerCraterDepositsIfNeeded()
+        {
+            if (!smoothInnerCraterDeposits || terrain == null || !hasImpact || lastImpactRadius <= 0.001f) return 0;
+
+            int passes = Mathf.Clamp(innerCraterSmoothPasses, 0, 64);
+            if (passes <= 0) return 0;
+
+            int movedTotal = 0;
+            int radiusCells = Mathf.CeilToInt(lastImpactRadius * Mathf.Clamp(innerCraterSmoothRadiusFactor, 0.10f, 0.95f) / Mathf.Max(terrain.CellSize, 0.0001f));
+            Vector3Int cc = terrain.WorldToCell(lastImpactCenter);
+            int minX = Mathf.Max(1, cc.x - radiusCells - innerCraterMoveRadiusCells);
+            int maxX = Mathf.Min(terrain.Width - 2, cc.x + radiusCells + innerCraterMoveRadiusCells);
+            int minZ = Mathf.Max(1, cc.z - radiusCells - innerCraterMoveRadiusCells);
+            int maxZ = Mathf.Min(terrain.Depth - 2, cc.z + radiusCells + innerCraterMoveRadiusCells);
+            int maxMovesPerColumn = Mathf.Clamp(innerCraterMaxMovesPerColumnPerPass, 1, 8);
+
+            for (int pass = 0; pass < passes; pass++)
+            {
+                int movedThisPass = 0;
+                for (int z = minZ; z <= maxZ; z++)
+                {
+                    for (int x = minX; x <= maxX; x++)
+                    {
+                        if (!IsInsideInnerCraterSmoothZone(x, z)) continue;
+
+                        int top = terrain.TopSolidY(x, z);
+                        if (top < 0 || top >= terrain.Height) continue;
+                        if (!IsMovableDepositedTopVoxel(x, z, top)) continue;
+
+                        float averageNeighbourTopY;
+                        int minNeighbourTopY;
+                        int maxNeighbourTopY;
+                        int neighbourTopCount;
+                        if (!TryNeighbourTopStats(x, z, out averageNeighbourTopY, out minNeighbourTopY, out maxNeighbourTopY, out neighbourTopCount)) continue;
+
+                        int allowedTop = Mathf.CeilToInt(averageNeighbourTopY + Mathf.Max(0.25f, innerCraterMaxProminenceCells));
+                        int moves = Mathf.Min(maxMovesPerColumn, Mathf.Max(0, top - allowedTop));
+                        for (int m = 0; m < moves; m++)
+                        {
+                            top = terrain.TopSolidY(x, z);
+                            if (top <= allowedTop || !IsMovableDepositedTopVoxel(x, z, top)) break;
+
+                            Vector3Int target;
+                            if (!TryFindLowInnerCraterTarget(x, z, top, out target)) break;
+
+                            VoxelCell3D source = terrain.Get(x, top, z);
+                            terrain.SetSolid(x, top, z, false, 0f, 0f, 0f, false);
+                            terrain.SetSolid(target.x, target.y, target.z, true, Mathf.Max(1f, source.temperature), 0f, 0.1f, true);
+                            movedThisPass++;
+                            movedTotal++;
+                        }
+                    }
+                }
+
+                if (movedThisPass == 0) break;
+            }
+
+            return movedTotal;
+        }
+
+        private bool ShouldDiscardInnerCraterParticle(SPHParticle3D p, float speed)
+        {
+            if (!discardOldParticlesInsideInnerCrater || p == null) return false;
+            if (!IsInsideBlockedCraterInterior(p.position)) return false;
+            if (p.age < Mathf.Max(0f, innerCraterDiscardMinAge)) return false;
+            if (speed > Mathf.Max(0.01f, innerCraterDiscardMaxSpeed)) return false;
+            return p.temperature <= solidifyTemperature + forceDepositTemperatureBonus;
         }
 
         private bool IsCenterCaptureAllowed(SPHParticle3D p, float speed)
@@ -1824,6 +2453,21 @@ namespace MeteoriteSPH3D
                     }
 
                     Vector3 cp = terrain.CellCenter(x, y, z);
+                    bool insideCraterSmoothingZone = IsInsideInnerCraterSmoothZone(cp);
+                    if (preventInnerCraterPileup && hasImpact)
+                    {
+                        Vector2 craterFlat = new Vector2(cp.x - lastImpactCenter.x, cp.z - lastImpactCenter.z);
+                        float blockRadius = lastImpactRadius * Mathf.Clamp(innerCraterDepositBlockRadiusFactor, 0.05f, 0.95f);
+                        // Legacy emergency switch. By default this is disabled: inner crater material is allowed and then smoothed.
+                        if (craterFlat.sqrMagnitude < blockRadius * blockRadius) continue;
+                    }
+
+                    if (insideCraterSmoothingZone && antiPillarDepositEnabled && hasNeighbourStats)
+                    {
+                        float innerAllowed = Mathf.Max(0.25f, innerCraterMaxProminenceCells);
+                        if (localProminence > innerAllowed + (forced ? 0.75f : 0.0f)) continue;
+                    }
+
                     float verticalPenalty = Mathf.Abs(cp.y - position.y) * 0.35f;
                     float upwardPenalty = Mathf.Max(0f, cp.y - position.y) * 1.2f;
                     float score = horizontalCellDist * (forced ? 1.65f : 2.8f) + verticalPenalty + upwardPenalty;
@@ -1836,6 +2480,15 @@ namespace MeteoriteSPH3D
                         float prominencePenaltyMul = forced ? 0.35f : 1f;
                         score += Mathf.Max(0f, localProminence) * antiPillarProminencePenalty * prominencePenaltyMul;
                         if (sameLevelCardinalSupport == 0) score += forced ? 0.45f : 1.4f;
+                    }
+
+                    if (insideCraterSmoothingZone && hasNeighbourStats)
+                    {
+                        // Inside the bowl, prefer low supported cells. This allows center deposition
+                        // but avoids putting every slow particle into the same already-high column.
+                        score += Mathf.Max(0f, localProminence) * 5.5f;
+                        score += Mathf.Max(0f, y - minNeighbourTopY) * 0.24f;
+                        if (sameLevelCardinalSupport == 0) score += 1.25f;
                     }
 
                     if (hasImpact)

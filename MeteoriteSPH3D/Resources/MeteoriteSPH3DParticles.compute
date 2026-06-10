@@ -50,6 +50,7 @@ struct GpuDepositResult
 
 RWStructuredBuffer<GpuDepositResult> _GpuDepositResults;
 RWStructuredBuffer<int> _GpuDepositResultCounter;
+RWStructuredBuffer<int> _GpuDepositColumnClaims;
 
 int _DepositCandidateCapacity;
 float _DepositMinAge;
@@ -82,6 +83,7 @@ float _ColdViscosityTemperature;
 float _HotViscosityTemperature;
 float _Gravity;
 float _Damping;
+float _DampingFactor;
 float _CollisionFriction;
 float _MaxVelocity;
 float _MaxAcceleration;
@@ -227,6 +229,11 @@ void Integrate(uint3 id : SV_DispatchThreadID)
     bool semiSolid = p.temperature <= _SemiSolidTemperature;
     float gravityMul = semiSolid ? _SemiSolidGravityMultiplier : 1.0;
     float3 acc = float3(0.0, -_Gravity * gravityMul, 0.0);
+    float spacing = min(max(_ParticleSpacing, _ParticleRadius * 2.0), h * 0.98);
+    float xsphBlend = saturate(_XsphVelocityBlend);
+    float3 xsph = float3(0.0, 0.0, 0.0);
+    float xsphW = 0.0;
+    float3 baseVelocity = p.velocity;
 
     int3 baseCell = ParticleCell(p.position);
     [loop]
@@ -254,21 +261,21 @@ void Integrate(uint3 id : SV_DispatchThreadID)
             float3 dir = diff / r;
             float qn = saturate(1.0 - r / h);
 
+            float invQDens = 1.0 / max(_MinDensity, q.density);
             float pressurePair = (p.pressure + q.pressure) * 0.5;
-            acc += dir * (_PressureStrength * pressurePair * qn * qn / max(_MinDensity, q.density));
+            acc += dir * (_PressureStrength * pressurePair * qn * qn * invQDens);
 
             // Near pressure now acts through the full smoothing radius, not only inside
             // particle spacing. This makes particle-particle interaction visible earlier.
             float nearPair = (p.nearDensity + q.nearDensity) * 0.5;
             float nearKernelWide = qn * qn * qn;
-            acc += dir * (_NearPressureStrength * nearPair * nearKernelWide / max(_MinDensity, q.density));
+            acc += dir * (_NearPressureStrength * nearPair * nearKernelWide * invQDens);
 
-            float spacing = min(max(_ParticleSpacing, _ParticleRadius * 2.0), h * 0.98);
             if (r < spacing)
             {
                 float sn = saturate(1.0 - r / spacing);
                 float nearKernelContact = sn * sn * (2.0 - sn);
-                acc += dir * (_NearPressureStrength * 0.55 * nearPair * nearKernelContact / max(_MinDensity, q.density));
+                acc += dir * (_NearPressureStrength * 0.55 * nearPair * nearKernelContact * invQDens);
             }
             else
             {
@@ -277,14 +284,20 @@ void Integrate(uint3 id : SV_DispatchThreadID)
                 float denom = max(0.0001, h - spacing);
                 float ct = saturate((r - spacing) / denom);
                 float cohesionKernel = ct * (1.0 - ct) * 4.0;
-                acc -= dir * (_CohesionStrength * cohesionKernel * q.mass / max(_MinDensity, q.density));
+                acc -= dir * (_CohesionStrength * cohesionKernel * q.mass * invQDens);
             }
 
             float pairTemp = (p.temperature + q.temperature) * 0.5;
             float tempT = saturate((pairTemp - _ColdViscosityTemperature) / max(0.0001, _HotViscosityTemperature - _ColdViscosityTemperature));
             float pairVisc = _Viscosity * lerp(_ColdViscosityMultiplier, 1.0, tempT);
             if (semiSolid || q.temperature <= _SemiSolidTemperature) pairVisc *= _SemiSolidViscosityMultiplier;
-            acc += (q.velocity - p.velocity) * (pairVisc * qn / max(1.0, q.density));
+            float3 dv = q.velocity - baseVelocity;
+            acc += dv * (pairVisc * qn / max(1.0, q.density));
+            if (xsphBlend > 0.0001)
+            {
+                xsph += dv * qn;
+                xsphW += qn;
+            }
         }
     }
 
@@ -293,48 +306,15 @@ void Integrate(uint3 id : SV_DispatchThreadID)
 
     p.velocity += acc * dt;
 
-    // XSPH-like neighbour velocity blending. When blend is zero, skip the extra neighbour pass entirely.
-    float xsphBlend = saturate(_XsphVelocityBlend);
-    if (xsphBlend > 0.0001)
+    // XSPH is accumulated during the force pass above, so Integrate no longer
+    // performs a second 27-cell neighbour traversal.
+    if (xsphBlend > 0.0001 && xsphW > 0.0001)
     {
-        float3 xsph = float3(0.0, 0.0, 0.0);
-        float xsphW = 0.0;
-        [loop]
-        for (int dz2 = -1; dz2 <= 1; dz2++)
-        [loop]
-        for (int dy2 = -1; dy2 <= 1; dy2++)
-        [loop]
-        for (int dx2 = -1; dx2 <= 1; dx2++)
-        {
-            int3 nc2 = baseCell + int3(dx2, dy2, dz2);
-            if (any(nc2 < int3(0,0,0)) || any(nc2 >= _GridSize)) continue;
-            int ci2 = CellIndex(nc2);
-            int count2 = min(_CellCounts[ci2], _MaxParticlesPerCell);
-            [loop]
-            for (int n2 = 0; n2 < count2; n2++)
-            {
-                int qi2 = _CellItems[ci2 * _MaxParticlesPerCell + n2];
-                if (qi2 == (int)i) continue;
-                Particle q2 = _Particles[qi2];
-                if (q2.active < 0.5) continue;
-                float3 d2 = q2.position - p.position;
-                float rr2 = dot(d2, d2);
-                if (rr2 <= 0.0000001 || rr2 >= h * h) continue;
-                float rr = sqrt(rr2);
-                float w = saturate(1.0 - rr / h);
-                xsph += (q2.velocity - p.velocity) * w;
-                xsphW += w;
-            }
-        }
-        if (xsphW > 0.0001)
-        {
-            p.velocity += (xsph / xsphW) * xsphBlend * saturate(dt * 8.0);
-        }
+        p.velocity += (xsph / xsphW) * xsphBlend * saturate(dt * 8.0);
     }
 
-    float dampingBase = max(saturate(_Damping), 0.0001);
-    float dampingPower = max(dt * 60.0, 0.0);
-    p.velocity *= exp(log(dampingBase) * dampingPower);
+    // Precomputed on CPU per dispatch. Avoid exp(log()) per particle.
+    p.velocity *= _DampingFactor;
     if (semiSolid) p.velocity *= lerp(1.0, _SemiSolidVelocityDamping, saturate(dt * 10.0));
 
     float speed = length(p.velocity);
@@ -498,6 +478,15 @@ float _GpuDepositMaxSpeed;
 float _GpuDepositForcedAge;
 int _GpuDepositTailMode;
 int _GpuDepositResultCapacity;
+int _GpuDepositTerrainColumnCount;
+int _GpuDepositClaimStamp;
+float3 _GpuDepositImpactCenter;
+float _GpuDepositInnerBlockRadius;
+int _GpuDepositDiscardInnerTail;
+float _GpuDepositInnerDiscardMinAge;
+float _GpuDepositInnerDiscardMaxSpeed;
+float _GpuDepositInnerSmoothRadius;
+float _GpuDepositInnerMaxProminenceCells;
 
 bool IsGpuDepositCandidate(Particle p)
 {
@@ -510,17 +499,74 @@ bool IsGpuDepositCandidate(Particle p)
     return coldEnough && oldEnough && slowEnough && contactOrOld;
 }
 
+bool IsInsideGpuDepositBlockedCrater(float3 worldPos)
+{
+    // Legacy hard-block hook. It is intentionally disabled by the controller for the
+    // final benchmark path: center deposition is allowed, only vertical pillar growth is suppressed.
+    if (_GpuDepositInnerBlockRadius <= 0.0001) return false;
+    float2 d = worldPos.xz - _GpuDepositImpactCenter.xz;
+    return dot(d, d) < _GpuDepositInnerBlockRadius * _GpuDepositInnerBlockRadius;
+}
+
+float InnerDepositProminenceLimit(float3 worldPos)
+{
+    if (_GpuDepositInnerSmoothRadius <= 0.0001) return 1000000.0;
+    float2 d = worldPos.xz - _GpuDepositImpactCenter.xz;
+    if (dot(d, d) > _GpuDepositInnerSmoothRadius * _GpuDepositInnerSmoothRadius) return 1000000.0;
+    return max(0.25, _GpuDepositInnerMaxProminenceCells);
+}
+
+float NeighbourAverageTopY(int x, int z, out int nMin, out int nMax, out int nCount)
+{
+    int vals[8];
+    vals[0] = TopSolidY(x + 1, z);
+    vals[1] = TopSolidY(x - 1, z);
+    vals[2] = TopSolidY(x, z + 1);
+    vals[3] = TopSolidY(x, z - 1);
+    vals[4] = TopSolidY(x + 1, z + 1);
+    vals[5] = TopSolidY(x - 1, z + 1);
+    vals[6] = TopSolidY(x + 1, z - 1);
+    vals[7] = TopSolidY(x - 1, z - 1);
+
+    int sum = 0;
+    nCount = 0;
+    nMin = 2147483647;
+    nMax = -2147483647;
+    [unroll]
+    for (int k = 0; k < 8; k++)
+    {
+        int v = vals[k];
+        if (v >= 0)
+        {
+            sum += v;
+            nCount++;
+            nMin = min(nMin, v);
+            nMax = max(nMax, v);
+        }
+    }
+
+    if (nCount <= 0)
+    {
+        nMin = -1;
+        nMax = -1;
+        return -1.0;
+    }
+    return (float)sum / (float)nCount;
+}
+
 [numthreads(128, 1, 1)]
 void ClearGpuDeposits(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
     if (i == 0) _GpuDepositResultCounter[0] = 0;
-    if (i >= (uint)_GpuDepositResultCapacity) return;
 
-    GpuDepositResult r;
-    r.cellParticleValid = int4(0, 0, 0, -1);
-    r.temperatureFlags = float4(0.0, 0.0, 0.0, 0.0);
-    _GpuDepositResults[i] = r;
+    if (i < (uint)_GpuDepositResultCapacity)
+    {
+        GpuDepositResult r;
+        r.cellParticleValid = int4(0, 0, 0, -1);
+        r.temperatureFlags = float4(0.0, 0.0, 0.0, 0.0);
+        _GpuDepositResults[i] = r;
+    }
 }
 
 [numthreads(128, 1, 1)]
@@ -532,6 +578,28 @@ void ApplyGpuDeposits(uint3 id : SV_DispatchThreadID)
     Particle p = _Particles[i];
     if (p.active < 0.5) return;
     if (!IsGpuDepositCandidate(p)) return;
+
+    float speed = length(p.velocity);
+    if (_GpuDepositDiscardInnerTail != 0 && IsInsideGpuDepositBlockedCrater(p.position)
+        && (_GpuDepositTailMode != 0 || (p.age >= _GpuDepositInnerDiscardMinAge && speed <= _GpuDepositInnerDiscardMaxSpeed)))
+    {
+        int discardSlot;
+        InterlockedAdd(_GpuDepositResultCounter[0], 1, discardSlot);
+        if (discardSlot >= 0 && discardSlot < _GpuDepositResultCapacity)
+        {
+            GpuDepositResult dr;
+            dr.cellParticleValid = int4(-1, -1, -1, (int)i);
+            dr.temperatureFlags = float4(0.0, 0.0, 1.0, 1.0);
+            _GpuDepositResults[discardSlot] = dr;
+        }
+
+        p.active = 0.0;
+        p.velocity = float3(0.0, 0.0, 0.0);
+        p.temperature = 0.0;
+        p.position = float3(-100000.0, -100000.0, -100000.0);
+        _Particles[i] = p;
+        return;
+    }
 
     int3 c0 = (int3)floor(p.position / max(_TerrainCellSize, 0.0001));
     int radius = max(1, _GpuDepositSearchRadiusCells);
@@ -551,17 +619,35 @@ void ApplyGpuDeposits(uint3 id : SV_DispatchThreadID)
         float hdist = sqrt((float)(dx * dx + dz * dz));
         if (hdist > (float)radius + 0.01) continue;
 
+        float2 cellCenter2 = (float2((float)x + 0.5, (float)z + 0.5)) * _TerrainCellSize;
+        float3 cellWorld = float3(cellCenter2.x, p.position.y, cellCenter2.y);
+
         int top = TopSolidY(x, z);
         if (top < 0 || top >= _TerrainSize.y - 1) continue;
 
-        int neighbourMax = max(max(TopSolidY(x + 1, z), TopSolidY(x - 1, z)), max(TopSolidY(x, z + 1), TopSolidY(x, z - 1)));
+        int nMin;
+        int nMax;
+        int nCount;
+        float nAve = NeighbourAverageTopY(x, z, nMin, nMax, nCount);
         int y = top + 1;
-        if (neighbourMax >= 0 && y > neighbourMax + max(0, _GpuDepositMaxRiseAboveNeighbours)) continue;
+        if (nMax >= 0 && y > nMax + max(0, _GpuDepositMaxRiseAboveNeighbours)) continue;
 
         float yCenter = ((float)y + 0.5) * _TerrainCellSize;
+        float prominence = (nCount > 0) ? ((float)y - nAve) : 0.0;
+        float innerLimit = InnerDepositProminenceLimit(float3(cellCenter2.x, yCenter, cellCenter2.y));
+        if (prominence > innerLimit) continue;
+
         float verticalPenalty = abs(yCenter - p.position.y) * 0.35;
         float upwardPenalty = max(0.0, yCenter - p.position.y) * 1.2;
         float score = hdist * 2.25 + verticalPenalty + upwardPenalty;
+
+        // Soft anti-column behavior: prefer lower, neighbour-supported columns.
+        // This is not a center ban; it only prevents many particles from stacking into vertical needles.
+        if (nCount > 0)
+        {
+            score += max(0.0, prominence) * 4.5;
+            score += max(0.0, (float)y - (float)nMin) * 0.16;
+        }
 
         if (score < bestScore)
         {
@@ -578,6 +664,18 @@ void ApplyGpuDeposits(uint3 id : SV_DispatchThreadID)
     if (slot < 0 || slot >= _GpuDepositResultCapacity) return;
 
     int column = TerrainColumnIndex(bestX, bestZ);
+
+    // One deposit per terrain column per GPU-deposition dispatch. Without this, hundreds
+    // of particles can choose the same low center column from the same old top height and
+    // build a vertical spike through repeated InterlockedAdd. Failed claims simply keep
+    // the particle alive for a later dispatch, where it can choose another low column.
+    int expectedClaim = _GpuDepositColumnClaims[column];
+    if (expectedClaim == _GpuDepositClaimStamp) return;
+
+    int claimOld;
+    InterlockedCompareExchange(_GpuDepositColumnClaims[column], expectedClaim, _GpuDepositClaimStamp, claimOld);
+    if (claimOld != expectedClaim || claimOld == _GpuDepositClaimStamp) return;
+
     int oldTop;
     InterlockedAdd(_TerrainTopSolidY[column], 1, oldTop);
     int yFinal = oldTop + 1;

@@ -17,7 +17,9 @@ namespace MeteoriteSPH3D
         public bool useHeightfieldMeshing = true;
 
         [Header("Shadows")]
-        [Tooltip("Optional fallback: adds fake directional darkening into vertex colors. Disabled by default because the realtime shadow map now works on the voxel mesh.")]
+        [Tooltip("Realtime shadows on hundreds of chunks are expensive. Disabled by default for stable FPS; enable only for screenshots.")]
+        public bool enableRealtimeChunkShadows = false;
+        [Tooltip("Optional fallback: adds fake directional darkening into vertex colors. Disabled by default because it performs a ray-march per top face during remesh.")]
         public bool useBakedDirectionalShadows = false;
         [Range(0.0f, 1.0f)] public float bakedAmbient = 0.34f;
         [Range(0.0f, 1.5f)] public float bakedDiffuse = 0.78f;
@@ -125,6 +127,52 @@ namespace MeteoriteSPH3D
             chunkSize = Mathf.Clamp(newChunkSize, 4, 64);
             maxChunkRebuildsPerCall = Mathf.Max(1, newMaxChunkRebuildsPerCall);
             colliderUpdateIntervalFrames = Mathf.Max(1, newColliderUpdateIntervalFrames);
+        }
+
+        public bool RealtimeChunkShadowsEnabled
+        {
+            get { return enableRealtimeChunkShadows; }
+        }
+
+        public void SetRealtimeChunkShadows(bool enabled)
+        {
+            if (enableRealtimeChunkShadows == enabled && chunks != null) return;
+
+            enableRealtimeChunkShadows = enabled;
+            ApplyRealtimeChunkShadowState();
+        }
+
+        public void SetTerrainRenderQuality(bool heightfieldMeshing, bool bakedDirectionalShadows, VoxelTerrain3D terrain, bool rebuildNow)
+        {
+            bool changed = useHeightfieldMeshing != heightfieldMeshing || useBakedDirectionalShadows != bakedDirectionalShadows;
+            if (!changed) return;
+
+            useHeightfieldMeshing = heightfieldMeshing;
+            useBakedDirectionalShadows = bakedDirectionalShadows;
+
+            if (rebuildNow && terrain != null)
+            {
+                RebuildImmediate(terrain);
+            }
+            else
+            {
+                builtAtLeastOnce = false;
+            }
+        }
+
+        private void ApplyRealtimeChunkShadowState()
+        {
+            if (chunks == null) return;
+
+            ShadowCastingMode mode = enableRealtimeChunkShadows ? ShadowCastingMode.On : ShadowCastingMode.Off;
+            for (int i = 0; i < chunks.Length; i++)
+            {
+                Chunk chunk = chunks[i];
+                if (chunk == null || chunk.renderer == null) continue;
+
+                chunk.renderer.shadowCastingMode = mode;
+                chunk.renderer.receiveShadows = enableRealtimeChunkShadows;
+            }
         }
 
         public void RebuildImmediate(VoxelTerrain3D terrain)
@@ -243,10 +291,9 @@ namespace MeteoriteSPH3D
 
                         mf.sharedMesh = m;
                         mr.sharedMaterial = material;
-                        // Realtime shadows are enabled on the visible voxel chunks.
-                        // Particles still render without shadows, so only the terrain/rim casts.
-                        mr.shadowCastingMode = ShadowCastingMode.On;
-                        mr.receiveShadows = true;
+                        // Chunk shadows are toggled by MeteoriteSPH3DController: off during particle simulation, on after all particles settle.
+                        mr.shadowCastingMode = enableRealtimeChunkShadows ? ShadowCastingMode.On : ShadowCastingMode.Off;
+                        mr.receiveShadows = enableRealtimeChunkShadows;
                         mr.lightProbeUsage = LightProbeUsage.Off;
                         mr.reflectionProbeUsage = ReflectionProbeUsage.Off;
                         mc.sharedMesh = null;
